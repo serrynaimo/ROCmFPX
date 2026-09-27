@@ -3094,7 +3094,6 @@ bool server_prompt_cache::load_disk(
     SRV_INF("prompt cache disk load: entry=%" PRIu64 " lcp=%zu tokens=%zu checkpoints=%zu/%zu target_bytes=%zu draft_bytes=%zu spec_bytes=%zu total_bytes=%zu read_bytes=%zu load_ms=%.2f path=%s\n",
             entry_id, lcp, n_tokens_expected, n_ckpt_restored, n_checkpoints, target_bytes, draft_bytes, spec_bytes, total_bytes,
             nread_main + nread_drft + nread_ckpt, t_ms, disk_owned_path.c_str());
-    log_disk_state();
 
     return true;
 }
@@ -3152,14 +3151,20 @@ bool server_prompt_cache::erase_disk_state(
 }
 
 void server_prompt_cache::update_disk() {
+    bool changed = false;
+
     while (!disk_states.empty() && disk_size_total > disk_limit_size) {
         if (!erase_disk_state(disk_states.begin(), true, "lru-update-limit")) {
             disable_disk_saves("update-limit-removal", disk_owned_path);
             break;
         }
+        changed = true;
     }
 
-    log_disk_state();
+    // called on every cache update: only report when something was evicted
+    if (changed) {
+        log_disk_state();
+    }
 }
 
 void server_prompt_cache::log_disk_state() const {
@@ -3241,6 +3246,11 @@ bool server_prompt_cache::load(
     // entry wins (a shared prefix entry instead of a whole conversation).
     std::vector<std::list<server_prompt_disk_state>::iterator> dead;
 
+    // entries that share a prefix with the request but cannot be resumed from it; logged
+    // as one summary line per lookup (the per-entry detail is at debug level)
+    size_t n_skip_boundary   = 0;
+    size_t lcp_skip_boundary = 0;
+
     for (auto it = disk_states.begin(); it != disk_states.end(); ++it) {
         if (!it->usable) {
             continue;
@@ -3252,14 +3262,11 @@ bool server_prompt_cache::load(
 
         if (eff_cur == 0) {
             if (lcp_cur >= disk_min_gain) {
-                if (probe) {
-                    SRV_DBG("prompt cache skip: reason=boundary-mismatch source=disk entry=%" PRIu64 " lcp=%zu cached_tokens=%zu request_tokens=%zu checkpoints=%zu\n",
-                            it->id, lcp_cur, it->tokens.size(), tokens_new.size(), it->ckpts.size());
-                } else {
-                    SRV_INF("prompt cache skip: reason=boundary-mismatch source=disk entry=%" PRIu64 " lcp=%zu cached_tokens=%zu request_tokens=%zu checkpoints=%zu%s\n",
-                            it->id, lcp_cur, it->tokens.size(), tokens_new.size(), it->ckpts.size(),
-                            it->has_ckpt() ? " (request diverges before the oldest persisted checkpoint)" : "");
-                }
+                SRV_DBG("prompt cache skip: reason=boundary-mismatch source=disk entry=%" PRIu64 " lcp=%zu cached_tokens=%zu request_tokens=%zu checkpoints=%zu%s\n",
+                        it->id, lcp_cur, it->tokens.size(), tokens_new.size(), it->ckpts.size(),
+                        it->has_ckpt() ? " (request diverges before the oldest persisted checkpoint)" : "");
+                n_skip_boundary++;
+                lcp_skip_boundary = std::max(lcp_skip_boundary, lcp_cur);
             }
             continue;
         }
@@ -3292,7 +3299,7 @@ bool server_prompt_cache::load(
         }
 
         if (ckpt_n > 0 && lcp_cur != it->tokens.size()) {
-            SRV_INF("prompt cache candidate: source=disk entry=%" PRIu64 " via checkpoint n_tokens=%" PRId64 " lcp=%zu cached_tokens=%zu request_tokens=%zu\n",
+            SRV_DBG("prompt cache candidate: source=disk entry=%" PRIu64 " via checkpoint n_tokens=%" PRId64 " lcp=%zu cached_tokens=%zu request_tokens=%zu\n",
                     it->id, ckpt_n, lcp_cur, it->tokens.size(), tokens_new.size());
         }
 
@@ -3308,6 +3315,11 @@ bool server_prompt_cache::load(
         if (!erase_disk_state(it, false, "files-missing")) {
             disable_disk_saves("missing-entry-removal", disk_owned_path);
         }
+    }
+
+    if (n_skip_boundary > 0 && !probe && it_best_disk == disk_states.end()) {
+        SRV_INF("prompt cache: no disk entry usable, %zu share a prefix (longest lcp=%zu of %zu request tokens) but diverge before their oldest checkpoint\n",
+                n_skip_boundary, lcp_skip_boundary, tokens_new.size());
     }
 
     if (it_best_disk != disk_states.end()) {
