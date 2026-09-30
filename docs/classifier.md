@@ -21,13 +21,12 @@ POST /v1/classifier            (alias: /v1/systemone)
                            "probabilities": {...}, "confidence": 0.95}}}
 ```
 
-The routes sit behind the normal API key check. There are three ways to serve them:
+The routes sit behind the normal API key check. There are two ways to serve them:
 
 | Mode | Flag | What answers |
 |---|---|---|
 | native | `--classifier-head FILE` (+ `--classifier-config FILE`) | this server's own model |
 | router | (router mode, no model) | the child named by the request's `"model"`, e.g. a child started with `--classifier-head` |
-| forward | `--classifier-upstream URL` | an external service; `--classifier-models` limits which `"model"` values pass (default `tinyjev-4b,auto`) |
 
 ## Native mode
 
