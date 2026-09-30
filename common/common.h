@@ -659,6 +659,8 @@ struct common_params {
 
     std::vector<std::string> api_keys;
 
+    int gpu_keepalive_ms = 0; // >0: tiny memset on each used GPU every N ms so drivers never idle-evict VRAM (0 = off)
+
     std::string ssl_file_key  = "";                                                                         // NOLINT
     std::string ssl_file_cert = "";                                                                         // NOLINT
 
