@@ -82,3 +82,33 @@ llama-server -m TinyJev-4B-BF16.gguf -dev none -ngl 0 -c 4096 -np 1 -fa on -t 12
 
 Some Windows drivers evict an idle GPU's whole VRAM to system RAM seconds after it has no display work.
 `--gpu-keepalive-ms N` clears a 64 KiB buffer on each used GPU every N ms (generic backend API) so the device stays up.
+
+## Router mode
+
+One public port for chat and classifier models: the router starts each model as a child from a `--models-preset`
+INI and routes by the request's `"model"` (name or alias). Classifier routes whose `"model"` is missing or unknown go
+to the first model with `classifier-head` in its preset; `--models-default NAME` sends other requests without a
+known `"model"` (and GET routes such as `/slots` without `?model=`) to NAME, like a single-model server.
+
+```ini
+version = 1
+
+[qwen/qwen3.8-27b]
+model = E:\Models\...\Swift.gguf
+alias = swift
+load-on-startup = true
+gpu-keepalive-ms = 2000
+
+[tinyjev-4b]
+model = E:\Models\AnkitAI\TinyJev-4B-GGUF\TinyJev-4B-BF16.gguf
+alias = auto
+load-on-startup = true
+dev = none
+ngl = 0
+classifier-head = E:\Models\AnkitAI\TinyJev-4B-GGUF\head.safetensors
+classifier-config = E:\Models\AnkitAI\TinyJev-4B-GGUF\classifier.json
+```
+
+```
+llama-server --models-preset models.ini --models-max 0 --models-default qwen/qwen3.8-27b --port 1234
+```

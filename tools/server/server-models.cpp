@@ -305,6 +305,7 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_MODELS_MAX");
     preset.unset_option("LLAMA_ARG_MODELS_PRESET");
     preset.unset_option("LLAMA_ARG_MODELS_AUTOLOAD");
+    preset.unset_option("LLAMA_ARG_MODELS_DEFAULT");
     if (unset_model_args) {
         preset.unset_option("LLAMA_ARG_MODEL");
         preset.unset_option("LLAMA_ARG_MMPROJ");
@@ -681,7 +682,7 @@ void server_models::load_models() {
                     models_to_load.push_back(name);
                 }
             }
-            if ((int)models_to_load.size() > base_params.models_max) {
+            if (base_params.models_max > 0 && (int)models_to_load.size() > base_params.models_max) { // 0 = unlimited
                 throw std::runtime_error(string_format(
                     "number of models to load on startup (%zu) exceeds models_max (%d)",
                     models_to_load.size(), base_params.models_max));
@@ -1798,12 +1799,20 @@ static void res_err(std::unique_ptr<server_http_res> & res, const json & error_d
     res->data = safe_json_to_str({{ "error", error_data }});
 }
 
-static bool router_validate_model(std::string & name, server_models & models, bool models_autoload, std::unique_ptr<server_http_res> & res) {
-    if (name.empty()) {
+// fallback: --models-default, used when the name is missing or unknown (single-model server behavior)
+static bool router_validate_model(std::string & name, server_models & models, bool models_autoload, std::unique_ptr<server_http_res> & res,
+                                  const std::string & fallback = "") {
+    std::optional<server_model_meta> meta;
+    if (!name.empty()) {
+        meta = models.get_meta(name);
+    }
+    if (!meta.has_value() && !fallback.empty()) {
+        meta = models.get_meta(fallback);
+    }
+    if (name.empty() && !meta.has_value()) {
         res_err(res, format_error_response("model name is missing from the request", ERROR_TYPE_INVALID_REQUEST));
         return false;
     }
-    auto meta = models.get_meta(name);
     if (!meta.has_value()) {
         res_err(res, format_error_response(string_format("model '%s' not found", name.c_str()), ERROR_TYPE_INVALID_REQUEST));
         return false;
@@ -1902,7 +1911,7 @@ void server_models_routes::init_routes() {
         std::string name = req.get_param("model");
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
-        if (!router_validate_model(name, models, autoload, error_res)) {
+        if (!router_validate_model(name, models, autoload, error_res, params.models_default)) {
             return error_res;
         }
         if (autoload) {
@@ -1917,7 +1926,7 @@ void server_models_routes::init_routes() {
         std::string name = json_value(body, "model", std::string());
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
-        if (!router_validate_model(name, models, autoload, error_res)) {
+        if (!router_validate_model(name, models, autoload, error_res, params.models_default)) {
             return error_res;
         }
         // remember which child serves this conversation so the stream routes can route straight
@@ -1940,6 +1949,33 @@ void server_models_routes::init_routes() {
         // client may have dropped during the wait (page reload) and the session buffer must
         // still receive the generation for a later resume
         return models.proxy_request(req, method, name, true, waited && ticket != 0); // update last usage for POST request only
+    };
+
+    this->proxy_post_classifier = [this](const server_http_req & req) {
+        json body = json::parse(req.body);
+        std::string name = body.is_object() ? json_value(body, "model", std::string()) : std::string();
+        if (name.empty() || !models.get_meta(name).has_value()) {
+            std::string cls;
+            for (const auto & meta : models.get_all_meta()) {
+                std::string head;
+                if (meta.preset.get_option("LLAMA_ARG_CLASSIFIER_HEAD", head) && !head.empty()) {
+                    cls = meta.name;
+                    break;
+                }
+            }
+            if (cls.empty()) {
+                auto res = std::make_unique<server_http_res>();
+                res_err(res, format_error_response(name.empty()
+                        ? "no classifier model is configured (a model preset with classifier-head)"
+                        : string_format("model '%s' not found", name.c_str()), ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            body["model"] = cls;
+            server_http_req fwd = req;
+            fwd.body = body.dump();
+            return proxy_post(fwd);
+        }
+        return proxy_post(req);
     };
 
     this->post_router_models_load = [this](const server_http_req & req) {

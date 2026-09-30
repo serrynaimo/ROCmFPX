@@ -350,8 +350,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // In every mode the API key middleware has already run.
     std::shared_ptr<server_classifier> classifier;   // native mode, set once the model is loaded
     if (is_router_server) {
-        ctx_http.post("/v1/classifier", ex_wrapper(models_routes->proxy_post));
-        ctx_http.post("/v1/systemone",  ex_wrapper(models_routes->proxy_post));
+        ctx_http.post("/v1/classifier", ex_wrapper(models_routes->proxy_post_classifier));
+        ctx_http.post("/v1/systemone",  ex_wrapper(models_routes->proxy_post_classifier));
     } else if (!params.classifier_head.empty()) {
         server_http_context::handler_t native_h = [&classifier](const server_http_req & req) -> server_http_res_ptr {
             auto res = std::make_unique<server_http_res>();
