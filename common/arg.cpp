@@ -3592,6 +3592,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_API_KEY_FILE"));
     add_opt(common_arg(
+        {"--classifier-upstream"}, "URL",
+        "forward POST /v1/classifier and /v1/systemone (after the API key check) to this Jev-style decision service, "
+        "e.g. http://127.0.0.1:8077/v1/systemone; the caller's Authorization header is passed through (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.classifier_upstream = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CLASSIFIER_UPSTREAM"));
+    add_opt(common_arg(
+        {"--classifier-models"}, "LIST",
+        string_format("comma-separated \"model\" values that --classifier-upstream callers may request; requests without "
+                      "\"model\" are always allowed (default: %s)", params.classifier_models.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.classifier_models = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CLASSIFIER_MODELS"));
+    add_opt(common_arg(
         {"--ssl-key-file"}, "FNAME",
         "path to file a PEM-encoded SSL private key",
         [](common_params & params, const std::string & value) {

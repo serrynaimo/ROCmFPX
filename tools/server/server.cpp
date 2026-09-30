@@ -342,6 +342,58 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.post("/cors-proxy",      ex_wrapper(res_403));
     }
 
+    // Jev-style classifier forwarding: one public API on this port while the classifier (a CPU model with its own
+    // decision head, e.g. llama-tray's jev-server) stays on loopback. The API key middleware has already run, so only
+    // callers with a valid key get here; their Authorization header is passed through to the upstream.
+    if (!params.classifier_upstream.empty()) {
+        common_http_url up = common_http_parse_url(params.classifier_upstream);
+        if (up.host.empty() || (up.scheme != "http" && up.scheme != "https")) {
+            SRV_ERR("invalid --classifier-upstream URL: %s\n", params.classifier_upstream.c_str());
+            return 1;
+        }
+        if (up.path.empty() || up.path == "/") {
+            up.path = "/v1/systemone";
+        }
+        std::unordered_set<std::string> allowed_models;
+        for (const auto & m : string_split<std::string>(params.classifier_models, ',')) {
+            const std::string t = string_strip(m);
+            if (!t.empty()) {
+                allowed_models.insert(t);
+            }
+        }
+        server_http_context::handler_t classifier_h = [up, allowed_models](const server_http_req & req) -> server_http_res_ptr {
+            auto err = [](int status, const std::string & type, const std::string & msg) {
+                auto res = std::make_unique<server_http_res>();
+                res->status = status;
+                res->data = safe_json_to_str({{"error", {{"message", msg}, {"type", type}}}});
+                return res;
+            };
+            const json body = json::parse_no_throw(req.body);
+            if (body.is_discarded() || !body.is_object()) {
+                return err(400, "invalid_request_error", "request body must be a JSON object");
+            }
+            if (body.contains("model")) {
+                if (!body.at("model").is_string() || !allowed_models.count(body.at("model").get<std::string>())) {
+                    return err(403, "model_not_allowed", "this server only forwards classifier models: " + string_join(
+                        std::vector<std::string>(allowed_models.begin(), allowed_models.end()), ", "));
+                }
+            }
+            std::map<std::string, std::string> headers = {{"Content-Type", "application/json"}};
+            for (const auto & [key, value] : req.headers) {
+                if (proxy_header_to_lower(key) == "authorization") {
+                    headers["Authorization"] = value;
+                }
+            }
+            return std::make_unique<server_http_proxy>("POST", up.scheme, up.host, up.port, up.path, headers,
+                                                       req.body, req.files, req.should_stop, 120, 120);
+        };
+        ctx_http.post("/v1/classifier", ex_wrapper(classifier_h));
+        ctx_http.post("/v1/systemone",  ex_wrapper(classifier_h));
+        SRV_INF("classifier routes: POST /v1/classifier, /v1/systemone -> %s://%s:%i%s (models: %s)\n",
+                up.scheme.c_str(), common_http_format_host(up.host).c_str(), up.port, up.path.c_str(),
+                params.classifier_models.c_str());
+    }
+
     try {
         mcp_mgr.start(params);
     } catch (const std::exception & e) {
