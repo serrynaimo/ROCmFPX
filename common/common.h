@@ -664,6 +664,7 @@ struct common_params {
     std::string classifier_models   = "tinyjev-4b,auto"; // "model" values callers may request; a missing "model" is allowed
     std::string classifier_head     = "";                // native classifier: decision head (safetensors) on the loaded model
     std::string classifier_config   = "";                // native classifier: prompt layout / limits (JSON, e.g. a tinyjev.json)
+    int gpu_keepalive_ms = 0; // >0: tiny memset on each used GPU every N ms so drivers never idle-evict VRAM (0 = off)
 
     std::string ssl_file_key  = "";                                                                         // NOLINT
     std::string ssl_file_cert = "";                                                                         // NOLINT

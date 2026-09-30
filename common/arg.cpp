@@ -3575,6 +3575,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_API_KEY"));
     add_opt(common_arg(
+        {"--gpu-keepalive-ms"}, "N",
+        "every N ms, run a tiny memset on each GPU the server uses (all visible GPUs without -dev), so drivers that evict "
+        "an idle device's VRAM to system RAM (e.g. AMD on Windows when no display is driven) keep the model resident (default: 0 = off)",
+        [](common_params & params, int value) {
+            params.gpu_keepalive_ms = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_KEEPALIVE_MS"));
+    add_opt(common_arg(
         {"--api-key-file"}, "FNAME",
         "path to file containing API keys, one per line; lines starting with a hash are treated as comments (default: none)",
         [](common_params & params, const std::string & value) {
