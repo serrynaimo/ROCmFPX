@@ -662,6 +662,8 @@ struct common_params {
     // forward POST /v1/classifier and /v1/systemone to a Jev-style decision service (TypeSafe System One shape)
     std::string classifier_upstream = "";                // "" = routes disabled; e.g. http://127.0.0.1:8077/v1/systemone
     std::string classifier_models   = "tinyjev-4b,auto"; // "model" values callers may request; a missing "model" is allowed
+    std::string classifier_head     = "";                // native classifier: decision head (safetensors) on the loaded model
+    std::string classifier_config   = "";                // native classifier: prompt layout / limits (JSON, e.g. a tinyjev.json)
 
     std::string ssl_file_key  = "";                                                                         // NOLINT
     std::string ssl_file_cert = "";                                                                         // NOLINT

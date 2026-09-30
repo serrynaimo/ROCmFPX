@@ -3608,6 +3608,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CLASSIFIER_MODELS"));
     add_opt(common_arg(
+        {"--classifier-head"}, "FNAME",
+        "serve the loaded model as a Jev-style decision classifier: POST /v1/classifier and /v1/systemone answered natively "
+        "with this decision head (safetensors: q.weight, q.bias, k.weight, k.bias) on the model's hidden states, on whatever "
+        "backend the model runs on (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.classifier_head = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CLASSIFIER_HEAD"));
+    add_opt(common_arg(
+        {"--classifier-config"}, "FNAME",
+        "JSON with the classifier's prompt layout and limits (name, head.temperature, max_state, max_branch, "
+        "layout.tokens, layout.escape_special, layout.option_format, layout.boolean_labels); a tinyjev.json manifest "
+        "works as-is, missing keys use the pointer-family defaults (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.classifier_config = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CLASSIFIER_CONFIG"));
+    add_opt(common_arg(
         {"--ssl-key-file"}, "FNAME",
         "path to file a PEM-encoded SSL private key",
         [](common_params & params, const std::string & value) {

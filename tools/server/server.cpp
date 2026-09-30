@@ -4,6 +4,7 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "server-classifier.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -342,10 +343,41 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.post("/cors-proxy",      ex_wrapper(res_403));
     }
 
-    // Jev-style classifier forwarding: one public API on this port while the classifier (a CPU model with its own
-    // decision head, e.g. llama-tray's jev-server) stays on loopback. The API key middleware has already run, so only
-    // callers with a valid key get here; their Authorization header is passed through to the upstream.
-    if (!params.classifier_upstream.empty()) {
+    // Jev-style classifier routes (POST /v1/classifier, /v1/systemone), in one of three modes:
+    //  - router:  proxied to the child named by the request's "model" (e.g. a CPU child with --classifier-head)
+    //  - native:  --classifier-head: this server's own model answers (server-classifier.cpp), created after load_model
+    //  - forward: --classifier-upstream: passed to an external service (e.g. llama-tray's jev-server on loopback)
+    // In every mode the API key middleware has already run.
+    std::shared_ptr<server_classifier> classifier;   // native mode, set once the model is loaded
+    if (is_router_server) {
+        ctx_http.post("/v1/classifier", ex_wrapper(models_routes->proxy_post));
+        ctx_http.post("/v1/systemone",  ex_wrapper(models_routes->proxy_post));
+    } else if (!params.classifier_head.empty()) {
+        server_http_context::handler_t native_h = [&classifier](const server_http_req & req) -> server_http_res_ptr {
+            auto res = std::make_unique<server_http_res>();
+            auto err = [&](int status, const std::string & type, const std::string & msg) {
+                res->status = status;
+                res->data = safe_json_to_str({{"error", {{"message", msg}, {"type", type}}}});
+                return std::move(res);
+            };
+            auto cls = std::atomic_load(&classifier);
+            if (!cls) {
+                return err(503, "unavailable_error", "classifier is still loading");
+            }
+            const json body = json::parse_no_throw(req.body);
+            if (body.is_discarded() || !body.is_object()) {
+                return err(400, "invalid_request_error", "request body must be a JSON object");
+            }
+            try {
+                res->data = safe_json_to_str(cls->classify(body));
+            } catch (const std::invalid_argument & e) {
+                return err(422, "invalid_request_error", e.what());
+            }
+            return res;
+        };
+        ctx_http.post("/v1/classifier", ex_wrapper(native_h));
+        ctx_http.post("/v1/systemone",  ex_wrapper(native_h));
+    } else if (!params.classifier_upstream.empty()) {
         common_http_url up = common_http_parse_url(params.classifier_upstream);
         if (up.host.empty() || (up.scheme != "http" && up.scheme != "https")) {
             SRV_ERR("invalid --classifier-upstream URL: %s\n", params.classifier_upstream.c_str());
@@ -533,6 +565,21 @@ int llama_server(common_params & params, int argc, char ** argv) {
             }
             SRV_ERR("%s", "exiting due to model loading error\n");
             return 1;
+        }
+
+        if (!params.classifier_head.empty()) {
+            auto cls = std::make_shared<server_classifier>();
+            std::string err;
+            if (!cls->init(const_cast<llama_model *>(llama_get_model(ctx_server.get_llama_context())), params, err)) {
+                clean_up();
+                if (ctx_http.thread.joinable()) {
+                    ctx_http.thread.join();
+                }
+                SRV_ERR("exiting due to classifier error: %s\n", err.c_str());
+                return 1;
+            }
+            std::atomic_store(&classifier, cls);
+            SRV_INF("classifier routes: POST /v1/classifier, /v1/systemone answered by %s on this model\n", cls->config().name.c_str());
         }
 
         routes.update_meta(ctx_server);
