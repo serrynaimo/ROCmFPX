@@ -234,15 +234,35 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.get_slots                   = models_routes->proxy_get;
         routes.post_slots                  = models_routes->proxy_post;
 
+        // --models-api-loopback-only: model management from loopback clients only (the API key alone may be shared
+        // with outside callers that must not unload, reload or download models); only_reload limits it to ?reload
+        auto loopback_only = [&params](server_http_context::handler_t h, bool only_reload = false) -> server_http_context::handler_t {
+            if (!params.models_api_loopback_only) {
+                return h;
+            }
+            return [h, only_reload](const server_http_req & req) -> server_http_res_ptr {
+                const std::string & a = req.remote_addr;
+                const bool loopback = a.rfind("127.", 0) == 0 || a == "::1" || a.rfind("::ffff:127.", 0) == 0;
+                if (!loopback && (!only_reload || !req.get_param("reload").empty())) {
+                    auto res = std::make_unique<server_http_res>();
+                    res->status = 403;
+                    res->data = safe_json_to_str({{"error", {{"code", 403}, {"type", "permission_error"},
+                        {"message", "model management is only available from loopback clients"}}}});
+                    return res;
+                }
+                return h(req);
+            };
+        };
+
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
-        routes.get_models                  = models_routes->get_router_models;
+        routes.get_models                  = loopback_only(models_routes->get_router_models, true);
 
-        ctx_http.post("/models",               ex_wrapper(models_routes->post_router_models));
-        ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));
-        ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
+        ctx_http.post("/models",               ex_wrapper(loopback_only(models_routes->post_router_models)));
+        ctx_http.post("/models/load",          ex_wrapper(loopback_only(models_routes->post_router_models_load)));
+        ctx_http.post("/models/unload",        ex_wrapper(loopback_only(models_routes->post_router_models_unload)));
         ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
-        ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
+        ctx_http.del ("/models",               ex_wrapper(loopback_only(models_routes->del_router_models)));
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)

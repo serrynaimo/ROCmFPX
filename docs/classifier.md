@@ -112,3 +112,6 @@ classifier-config = E:\Models\AnkitAI\TinyJev-4B-GGUF\classifier.json
 ```
 llama-server --models-preset models.ini --models-max 0 --models-default qwen/qwen3.8-27b --port 1234
 ```
+
+The API key may be shared with outside callers (a gateway, a web page); `--models-api-loopback-only` keeps model
+management (load, unload, download via `POST /models`, delete, `GET /models?reload`) to loopback clients.

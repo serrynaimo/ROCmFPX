@@ -3778,6 +3778,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_DEFAULT"));
     add_opt(common_arg(
+        {"--models-api-loopback-only"},
+        "for router server, accept model management (POST /models, DELETE /models, /models/load, /models/unload, "
+        "GET /models?reload) only from loopback clients; everyone else gets 403 (default: disabled)",
+        [](common_params & params) {
+            params.models_api_loopback_only = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_API_LOOPBACK_ONLY"));
+    add_opt(common_arg(
         {"--jinja"},
         {"--no-jinja"},
         string_format("whether to use jinja template engine for chat (default: %s)", params.use_jinja ? "enabled" : "disabled"),

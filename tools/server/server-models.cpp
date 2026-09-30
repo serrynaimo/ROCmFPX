@@ -306,6 +306,7 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_MODELS_PRESET");
     preset.unset_option("LLAMA_ARG_MODELS_AUTOLOAD");
     preset.unset_option("LLAMA_ARG_MODELS_DEFAULT");
+    preset.unset_option("LLAMA_ARG_MODELS_API_LOOPBACK_ONLY");
     if (unset_model_args) {
         preset.unset_option("LLAMA_ARG_MODEL");
         preset.unset_option("LLAMA_ARG_MMPROJ");

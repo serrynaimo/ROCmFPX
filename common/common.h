@@ -696,6 +696,7 @@ struct common_params {
     std::string models_preset = "";     // directory containing model presets for the router server
     int models_max = 4;                 // maximum number of models to load simultaneously
     bool models_autoload = true;        // automatically load models when requested via the router server
+    bool models_api_loopback_only = false; // router: model management (load/unload/download/reload) only from loopback
     std::string models_default = "";    // router: model for requests whose "model" is missing or unknown ("" = reject them)
     std::string models_preset_hf = "";  // show a warning about remote presets on router loaded (if not empty)
 
