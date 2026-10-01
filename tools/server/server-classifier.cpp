@@ -5,11 +5,14 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "log.h"
+#include "hash/hash.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <regex>
 #include <stdexcept>
@@ -157,6 +160,91 @@ static bool classifier_eval_cb(struct ggml_tensor * t, bool ask, void * user_dat
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// answer cache: one append-only file per identity, lines of "<sha256 hex>\t<answer JSON>", all of it held in memory
+
+static const uintmax_t CACHE_MAX_BYTES = 64u << 20;   // over this at startup, the older half is dropped
+
+static std::string file_stamp(const std::string & path) {
+    std::error_code e1, e2;
+    const auto size = std::filesystem::file_size(path, e1);
+    const auto time = std::filesystem::last_write_time(path, e2);
+    return path + "|" + (e1 ? "?" : std::to_string(size)) + "|" + (e2 ? "?" : std::to_string(time.time_since_epoch().count()));
+}
+
+void server_classifier::cache_open(const common_params & params) {
+    if (params.classifier_cache.empty()) { return; }
+    const std::string ident = "v1\n" + file_stamp(params.model.path) + "\n" + file_stamp(params.classifier_head) + "\n" +
+                              file_stamp(params.classifier_config);
+    const std::string ident_hash = hash_sha256_hex(ident.data(), ident.size());
+    std::string name = cfg.name;
+    for (auto & c : name) { if (!std::isalnum((unsigned char) c) && c != '.' && c != '-' && c != '_') { c = '_'; } }
+
+    std::error_code ec;
+    const std::filesystem::path dir(params.classifier_cache);
+    std::filesystem::create_directories(dir, ec);
+    const std::filesystem::path file = dir / (name + "-" + ident_hash.substr(0, 16) + ".tsv");
+
+    std::vector<std::string> lines;
+    uintmax_t bytes = 0;
+    {
+        std::ifstream in(file, std::ios::binary);
+        for (std::string line; std::getline(in, line);) {
+            if (line.size() < 66 || line[64] != '\t') { continue; }   // e.g. a line cut short by a kill
+            bytes += line.size() + 1;
+            lines.push_back(std::move(line));
+        }
+    }
+    if (bytes > CACHE_MAX_BYTES) {
+        lines.erase(lines.begin(), lines.begin() + (std::ptrdiff_t) (lines.size() / 2));
+        const std::filesystem::path tmp = file.string() + ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            for (const auto & l : lines) { out << l << '\n'; }
+        }
+        std::filesystem::rename(tmp, file, ec);
+    }
+    for (const auto & l : lines) { cache[l.substr(0, 64)] = l.substr(65); }
+
+    cache_file.open(file, std::ios::binary | std::ios::app);
+    if (!cache_file) {
+        LOG_WRN("classifier: cannot write %s, answer cache disabled\n", file.string().c_str());
+        cache.clear();
+        return;
+    }
+    cache_ident = ident_hash;
+    CLS_INF("answer cache: %zu answers in %s\n", cache.size(), file.string().c_str());
+}
+
+// the key covers exactly what the answer depends on: the files (identity), the tokens the model sees, and the
+// answer keys / option texts that are echoed into the answer
+std::string server_classifier::cache_key(const std::vector<llama_token> & prefix, const encoded_question & e) const {
+    std::string h = cache_ident + "\n" + e.type + "\n" + std::to_string(prefix.size()) + " " + std::to_string(e.row.size()) + "\n";
+    for (const auto & k : e.keys) { h += k; h += '\x1f'; }
+    h += '\n';
+    for (const auto & o : e.opts) { h += o; h += '\x1f'; }
+    h += '\n';
+    h.append(reinterpret_cast<const char *>(prefix.data()), prefix.size() * sizeof(llama_token));
+    h.append(reinterpret_cast<const char *>(e.row.data()), e.row.size() * sizeof(llama_token));
+    return hash_sha256_hex(h.data(), h.size());
+}
+
+bool server_classifier::cache_get(const std::string & key, json & answer) {
+    std::lock_guard<std::mutex> lock(cache_mtx);
+    const auto it = cache.find(key);
+    if (it == cache.end()) { return false; }
+    answer = json::parse_no_throw(it->second);
+    return !answer.is_discarded();
+}
+
+void server_classifier::cache_put(const std::string & key, const json & answer) {
+    const std::string text = answer.dump();
+    std::lock_guard<std::mutex> lock(cache_mtx);
+    cache[key] = text;
+    cache_file << key << '\t' << text << '\n';
+    cache_file.flush();
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 
 bool server_classifier::init(llama_model * m, const common_params & params, std::string & err) {
     try {
@@ -189,6 +277,7 @@ bool server_classifier::init(llama_model * m, const common_params & params, std:
         if (!lctx) { throw std::runtime_error("failed to create the classifier context"); }
         CLS_INF("%s ready: family %s, head_dim %d, temperature %.4g, n_ctx %d, n_embd %d\n", cfg.name.c_str(), cfg.family.c_str(),
                 cfg.head_dim, cfg.temperature, n_ctx, n_embd);
+        cache_open(params);
         return true;
     } catch (const std::exception & e) {
         err = e.what();
@@ -291,17 +380,30 @@ json server_classifier::classify(const json & body) {
         enc.push_back(std::move(e));
     }
 
+    // --- answer cache: only the questions it does not hold reach the model ---
+    size_t n_miss = enc.size();
+    if (!cache_ident.empty()) {
+        for (auto & e : enc) {
+            e.cache_key = cache_key(prefix, e);
+            if (cache_get(e.cache_key, e.answer)) { n_miss--; } else { e.answer = json(); }
+        }
+    }
+
     // --- backbone: one pass for a single question; otherwise the state prefix once, then each row continues from it ---
-    json answers = json::object();
-    std::lock_guard<std::mutex> lock(mtx);
-    llama_memory_t mem = llama_get_memory(lctx);
-    llama_memory_clear(mem, true);
-    const bool shared = enc.size() > 1;
-    if (shared) {
-        decode_chunk(prefix, 0, { (int) prefix.size() - 1 });   // one output keeps llama_decode on its ordinary path
+    std::unique_lock<std::mutex> lock(mtx, std::defer_lock);
+    llama_memory_t mem = nullptr;
+    const bool shared = n_miss > 1;
+    if (n_miss > 0) {
+        lock.lock();
+        mem = llama_get_memory(lctx);
+        llama_memory_clear(mem, true);
+        if (shared) {
+            decode_chunk(prefix, 0, { (int) prefix.size() - 1 });   // one output keeps llama_decode on its ordinary path
+        }
     }
     const float scale = 1.0f / std::sqrt((float) cfg.head_dim) / (float) cfg.temperature;
     for (auto & e : enc) {
+        if (!e.answer.is_null()) { continue; }   // cached
         std::vector<int> want = e.close_pos;
         want.push_back(e.decide);
         std::sort(want.begin(), want.end());
@@ -372,12 +474,18 @@ json server_classifier::classify(const json & body) {
             a["probabilities"] = probs;
             a["confidence"] = r2(1.0 - spread / (double) (p.size() - 1));
         }
-        answers[e.id] = a;
+        if (!e.cache_key.empty()) { cache_put(e.cache_key, a); }
+        e.answer = a;
     }
+    if (lock.owns_lock()) { lock.unlock(); }
+
+    json answers = json::object();
+    for (auto & e : enc) { answers[e.id] = e.answer; }
 
     json res = json::object();
     res["model"] = body.contains("model") && body.at("model").is_string() ? body.at("model").get<std::string>() : cfg.name;
     res["answers"] = answers;
+    if (!cache_ident.empty()) { res["cached"] = n_miss == 0; }
     res["latency_ms"] = std::round(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() * 100.0) / 100.0;
     return res;
 }

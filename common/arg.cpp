@@ -3618,6 +3618,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CLASSIFIER_CONFIG"));
     add_opt(common_arg(
+        {"--classifier-cache"}, "DIR",
+        "keep the classifier's answers in DIR and answer a repeated question about the same state from there instead of "
+        "running the model; one file per model + head + config, so changing any of them starts a fresh cache "
+        "(default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.classifier_cache = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CLASSIFIER_CACHE"));
+    add_opt(common_arg(
         {"--ssl-key-file"}, "FNAME",
         "path to file a PEM-encoded SSL private key",
         [](common_params & params, const std::string & value) {

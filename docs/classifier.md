@@ -62,6 +62,13 @@ the final normed hidden state at `<decide>` (query) against each `<close>` (keys
 `z_i = (W_k h_i + b_k) . (W_q h_decide + b_q) / sqrt(head_dim) / temperature`, softmax over the options.
 Several questions about one state share the state's computation.
 
+`--classifier-cache DIR` adds a persistent answer cache. The model is deterministic, so an answer depends only on
+the model, head and config files and on the tokens of the state and the question. Each answer is appended to
+`DIR/<name>-<identity>.tsv` (one line per answer, loaded into memory at start) and a repeated question about the same
+state is answered without a decode. Caching is per question, so a request may mix cached and fresh answers; the
+response carries `"cached": true` when nothing had to be decoded. Changing the model, head or config starts a new
+file; a file over 64 MiB loses its older half at the next start.
+
 Implementation notes (`tools/server/server-classifier.cpp`): a private `llama_context` on the loaded weights (own
 small KV cache, `-c` sized, 4096 by default), embeddings mode OFF with outputs requested only for `<decide>` and the
 `<close>` positions, and the post-norm hidden state captured from the graph (`result_norm`) through the eval

@@ -14,12 +14,18 @@
 //     z_i = (W_k h_close_i + b_k) . (W_q h_decide + b_q) / sqrt(head_dim) / temperature
 // Only those rows are requested as outputs; the post-norm hidden state is captured from the graph ("result_norm")
 // with embeddings mode off, because embeddings mode would force every token through the last layer and lm_head.
+//
+//   --classifier-cache  DIR   persistent answer cache. The model is deterministic, so an answer is a pure function of
+//                             (model, head, config, state, question); each one is appended to DIR/<name>-<identity>.tsv
+//                             and a repeated question about the same state is answered from memory without a decode.
 
 #include "server-common.h"
 
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct llama_model;
@@ -55,6 +61,7 @@ struct server_classifier {
     ~server_classifier();
 
     // System One request {state, questions, model?} -> {model, answers, latency_ms}
+    // with --classifier-cache also "cached": true when every answer came from the cache (nothing was decoded)
     // throws std::invalid_argument for bad requests (-> 422); thread-safe (requests are serialized)
     json classify(const json & body);
 
@@ -67,7 +74,14 @@ private:
         std::vector<llama_token> row;         // question row (after the shared state prefix)
         int decide = 0;                       // absolute position of <decide>
         std::vector<int> close_pos;           // absolute positions of each <close>
+        std::string cache_key;                // "" = cache off
+        json answer;                          // null until answered (from the cache or the model)
     };
+
+    void cache_open(const common_params & params);
+    std::string cache_key(const std::vector<llama_token> & prefix, const encoded_question & e) const;
+    bool cache_get(const std::string & key, json & answer);
+    void cache_put(const std::string & key, const json & answer);
 
     std::vector<llama_token> user_tokens(const std::string & text) const;
     std::vector<float> hidden_rows(const std::vector<llama_token> & prefix, const std::vector<encoded_question> & qs,
@@ -81,6 +95,12 @@ private:
     llama_token id_state = -1, id_question = -1, id_option = -1, id_close = -1, id_decide = -1;
     std::vector<float> wq, bq, wk, bk;  // [head_dim, n_embd] row-major, [head_dim]
     std::mutex mtx;
+
+    // answer cache: key (sha256 of identity + exact model input) -> answer JSON text, mirrored in an append-only file
+    std::string cache_ident;
+    std::unordered_map<std::string, std::string> cache;
+    std::ofstream cache_file;
+    std::mutex cache_mtx;
 
 public:
     // graph callback state (filled by the eval callback during llama_decode)
