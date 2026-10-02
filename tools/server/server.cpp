@@ -543,9 +543,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
             std::string err;
             if (!cls->init(const_cast<llama_model *>(llama_get_model(ctx_server.get_llama_context())), params, err)) {
                 clean_up();
-                if (ctx_http.thread.joinable()) {
-                    ctx_http.thread.join();
-                }
+                ctx_http.join();
                 SRV_ERR("exiting due to classifier error: %s\n", err.c_str());
                 return 1;
             }
