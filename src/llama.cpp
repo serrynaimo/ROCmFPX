@@ -2,6 +2,7 @@
 #include "rocmfpx-plugin.h"
 
 #include "llama-impl.h"
+#include "llama-version.h"
 
 #include "llama-chat.h"
 #include "llama-context.h"
@@ -434,6 +435,7 @@ static struct llama_model * llama_model_load_from_file_impl(
             return nullptr;
         }
     }
+    // TODO: remove
     ggml_time_init();
 
     if (!params.vocab_only && ggml_backend_reg_count() == 0) {

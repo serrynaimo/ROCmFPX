@@ -644,6 +644,14 @@ void quantize_scatter_mmq_q8_1_cuda(
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(n_tokens, block_num_y, 1);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+#if GGML_ROCMI4_W4A4
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (type_src0 == GGML_TYPE_Q4_0_ROCMI4 && GGML_CUDA_CC_IS_GFX1151(cc)) {
+        quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, true, true><<<num_blocks, block_size, 0, stream>>>(
+                x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
+        return;
+    }
+#endif
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, true><<<num_blocks, block_size, 0, stream>>>(

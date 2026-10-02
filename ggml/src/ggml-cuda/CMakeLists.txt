@@ -1,5 +1,18 @@
 cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
+# ARM64EC uses the x64 ABI, so it needs the x64 import libraries. The arm64 ones
+# hold native ARM64 symbols and cannot satisfy EC references at link time.
+# FindCUDAToolkit picks the library dir from the host arch, not the target, so
+# anchor its search at lib/x64 here. It derives everything else from CUDA_CUDART.
+string(TOLOWER "${CMAKE_GENERATOR_PLATFORM}" GGML_CUDA_PLATFORM_LWR)
+if (MSVC AND GGML_CUDA_PLATFORM_LWR STREQUAL "arm64ec")
+    find_library(CUDA_CUDART
+        NAMES cudart
+        HINTS ${CUDAToolkit_ROOT} ENV CUDA_PATH
+        PATH_SUFFIXES lib/x64
+    )
+endif()
+
 find_package(CUDAToolkit)
 
 if (CUDAToolkit_FOUND)
@@ -117,26 +130,27 @@ if (CUDAToolkit_FOUND)
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
         add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
     else()
-        list(APPEND GGML_SOURCES_CUDA
-            template-instances/fattn-vec-instance-f16-f16.cu
-            template-instances/fattn-vec-instance-q4_0-q4_0.cu
+        ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
+        list(APPEND GGML_SOURCES_CUDA ${SRCS}
             template-instances/fattn-vec-instance-q4_0_rocmfp4-q4_0_rocmfp4.cu
             template-instances/fattn-vec-instance-q4_0_rocmfp4_fast-q4_0_rocmfp4_fast.cu
             template-instances/fattn-vec-instance-q3_0_rocmfpx-q3_0_rocmfpx.cu
             template-instances/fattn-vec-instance-q6_0_rocmfpx-q6_0_rocmfpx.cu
             template-instances/fattn-vec-instance-q8_0_rocmfpx-q8_0_rocmfpx.cu
-            template-instances/fattn-vec-instance-q8_0-q8_0.cu
-            template-instances/fattn-vec-instance-bf16-bf16.cu
             template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
-            template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu)
+            template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu
+            template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
+            template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu
+            template-instances/fattn-vec-instance-q8_0-turbo3_0.cu
+            template-instances/fattn-vec-instance-q8_0-turbo4_0.cu
+            template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
+            template-instances/fattn-vec-instance-turbo4_0-q8_0.cu)
     endif()
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
-
-    add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)

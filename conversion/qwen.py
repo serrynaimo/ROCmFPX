@@ -10,7 +10,7 @@ import torch
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import LazyTorchTensor, ModelBase, TextModel, gguf, logger
+from .base import LazyTorchTensor, ModelBase, ModelType, TextModel, get_model_architecture, gguf, logger
 
 
 @ModelBase.register("QWenLMHeadModel")
@@ -290,6 +290,7 @@ class _QwenMtpMixin:
     tensor_map: gguf.TensorNameMap
     no_mtp: bool
     mtp_only: bool
+    mtp_shared_embd: bool
     _original_block_count: int | None = None
     opt_num_mtp_layers: int = 0
 
@@ -338,7 +339,7 @@ class _QwenMtpMixin:
             elif len(parts) == 3 and parts[1] in remapper:
                 name = f"model.layers.{cls._original_block_count}.{remapper[parts[1]]}.{parts[2]}"
         elif cls.mtp_only:
-            keep = name in (
+            keep = not cls.mtp_shared_embd and name in (
                 "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
                 "embed_tokens.weight", "norm.weight",
             )
@@ -379,6 +380,13 @@ class Qwen3NextModel(_QwenMtpMixin, Qwen2MoeModel):
         self.gguf_writer.add_ssm_group_count(self.hparams["linear_num_key_heads"])
         self.gguf_writer.add_ssm_time_step_rank(self.hparams["linear_num_value_heads"])
         self.gguf_writer.add_ssm_inner_size(self.hparams["linear_value_head_dim"] * self.hparams["linear_num_value_heads"])
+        if (layer_types := self.hparams.get("layer_types")) is not None:
+            n_layer = self.hparams["num_hidden_layers"]
+            if len(layer_types) != n_layer:
+                raise ValueError(f"layer_types has {len(layer_types)} entries, expected num_hidden_layers ({n_layer})")
+            recurrent = [t == "linear_attention" for t in layer_types]
+            recurrent += [False] * (self.block_count - n_layer)
+            self.gguf_writer.add_recurrent_layers(recurrent)
         self.gguf_writer.add_full_attention_interval(self.hparams.get("full_attention_interval", 4))
         if (rope_dim := self.hparams.get("head_dim")) is None:
             rope_dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
@@ -659,7 +667,7 @@ class DFlashModel(Qwen3Model):
         from . import get_model_class
         with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
             target_hparams = json.load(f)
-            target_arch = target_hparams["architectures"][0]
+        target_arch = get_model_architecture(target_hparams, ModelType.TEXT)
         target_cls = get_model_class(target_arch)
 
         if target_cls is not type(self):
@@ -704,7 +712,7 @@ class DFlashModel(Qwen3Model):
         if embedding_scale is not None:
             self.gguf_writer.add_embedding_scale(float(embedding_scale))
 
-        target_layer_ids = dflash_config.get("target_layer_ids", [])
+        target_layer_ids = dflash_config.get("target_layer_ids", self.hparams.get("target_layer_ids", []))
         if target_layer_ids:
             extract_layer_ids = [i + 1 for i in target_layer_ids]
             self.gguf_writer.add_target_layers(extract_layer_ids)
@@ -712,8 +720,9 @@ class DFlashModel(Qwen3Model):
         use_sliding_window = self.hparams.get("use_sliding_window", False) or dflash_config.get("use_swa", False)
         sliding_window = dflash_config.get("swa_window_size") or self.hparams.get("sliding_window")
         layer_types = self.hparams.get("layer_types")
-        if use_sliding_window and sliding_window and layer_types:
-            is_swa = [lt == "sliding_attention" for lt in layer_types]
+        if use_sliding_window and sliding_window:
+            is_swa = ([True] * self.block_count if dflash_config.get("use_swa", False)
+                      else [lt == "sliding_attention" for lt in layer_types or []])
             self.gguf_writer.add_sliding_window(sliding_window)
             self.gguf_writer.add_sliding_window_pattern(is_swa)
 
@@ -833,13 +842,6 @@ class DSparkModel(DFlashModel):
             return None
         return super().filter_tensors(item)
 
-    _ROPE_PERMUTE_SUFFIXES = (
-        "self_attn.q_proj.weight",
-        "self_attn.k_proj.weight",
-        "self_attn.q_norm.weight",
-        "self_attn.k_norm.weight",
-    )
-
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if name == "model.d2t":
             self._d2t = data_torch
@@ -847,12 +849,6 @@ class DSparkModel(DFlashModel):
 
         if self._n_vocab_draft == self.hparams["vocab_size"] and name.endswith("lm_head.weight"):
             return
-
-        # interleaved-rope checkpoints (rope_is_neox_style = false) -> NeoX layout: per head, even dims first then odd
-        if not self.hparams.get("rope_is_neox_style", True) and name.endswith(self._ROPE_PERMUTE_SUFFIXES):
-            head_dim = self.hparams["head_dim"]
-            shape = data_torch.shape
-            data_torch = data_torch.reshape(-1, head_dim // 2, 2, *shape[1:]).transpose(1, 2).reshape(shape)
 
         yield from super().modify_tensors(data_torch, name, bid)
 

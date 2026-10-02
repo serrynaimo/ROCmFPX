@@ -352,7 +352,15 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #define VDR_ROCMFP4_Q8_1_MMQ  GGML_ROCMFP4_Q8_1_MMQ_VDR
 #define VDR_ROCMFP4_FAST_Q8_1_MMVQ GGML_ROCMFP4_FAST_Q8_1_MMVQ_VDR
 #define VDR_ROCMFP4_FAST_Q8_1_MMQ  GGML_ROCMFP4_FAST_Q8_1_MMQ_VDR
-#define VDR_ROCMI4_Q8_1_MMVQ VDR_ROCMFP4_FAST_Q8_1_MMVQ
+// Tune ROCmI4 MMVQ independently of the floating-point codebook formats.
+// The default preserves their established launch policy; gfx1151 can test 4.
+#ifndef GGML_ROCMI4_Q8_1_MMVQ_VDR
+#define GGML_ROCMI4_Q8_1_MMVQ_VDR VDR_ROCMFP4_FAST_Q8_1_MMVQ
+#endif
+#if GGML_ROCMI4_Q8_1_MMVQ_VDR != 1 && GGML_ROCMI4_Q8_1_MMVQ_VDR != 2 && GGML_ROCMI4_Q8_1_MMVQ_VDR != 4
+#error "GGML_ROCMI4_Q8_1_MMVQ_VDR must be 1, 2, or 4"
+#endif
+#define VDR_ROCMI4_Q8_1_MMVQ GGML_ROCMI4_Q8_1_MMVQ_VDR
 #define VDR_ROCMI4_Q8_1_MMQ  VDR_ROCMFP4_FAST_Q8_1_MMQ
 #ifndef GGML_ROCMFP3_Q8_1_MMVQ_VDR
 #define GGML_ROCMFP3_Q8_1_MMVQ_VDR 2
@@ -616,9 +624,21 @@ static __device__ __forceinline__ float vec_dot_rocmi4_q8_1(
 #pragma unroll
     for (int l = 0; l < VDR_ROCMI4_Q8_1_MMVQ; ++l) {
         const int aux_q4 = rocmfp4_get_qs_i32(bq4->qs, iqs + l);
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1151__)
+        // Exact signed int4 x int8 dot: split each int8 into low unsigned and
+        // high signed nibbles, preserving integer accumulation and FP scaling.
+        const unsigned mask = 0x0f0f0f0fu;
+        const unsigned a = (unsigned) q8[l + 0];
+        const unsigned b = (unsigned) q8[l + 4];
+        const unsigned lo = (a & mask) | ((b & mask) << 4);
+        const unsigned hi = ((a >> 4) & mask) | (b & 0xf0f0f0f0u);
+        const int upper = __builtin_amdgcn_sudot8(true, aux_q4, true, (int) hi, 0, false);
+        sumi = __builtin_amdgcn_sudot8(true, aux_q4, false, (int) lo, sumi + 16 * upper, false);
+#else
         const int2 v = rocmi4_unpack_signed_nibbles(aux_q4);
         sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
         sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+#endif
     }
 
     return __low2float(bq8_1->ds) * rocmfpx_ue4m3_to_fp32_finite(bq4->e) * sumi;
@@ -972,7 +992,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> i) << 2) & 0x04040404;
 
-        const int vi = __vsubss4(vil, vih);
+        const int vi = __vsub4(vil, vih);
 
         sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }
@@ -1139,7 +1159,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
 
-        const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
+        const int vi = __vsub4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
 
         sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }
@@ -1437,16 +1457,20 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     v[0] = q4[0];
     v[1] = q4[4];
 
+    // branchless so nvcc can hoist this out of the ncols_dst loop
     const uint16_t * scales = (const uint16_t *)bq4_K->scales;
+    const int j  = bq8_offset/2;
+    const int jm = j & 1;
+
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
+
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+
     uint16_t aux[2];
-    const int j = bq8_offset/2;
-    if (j < 2) {
-        aux[0] = scales[j+0] & 0x3f3f;
-        aux[1] = scales[j+2] & 0x3f3f;
-    } else {
-        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
-        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
-    }
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
@@ -1482,16 +1506,21 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     vh[0] = qh[0] >> bq8_offset;
     vh[1] = qh[4] >> bq8_offset;
 
+    // same as q4_K
     const uint16_t * scales = (const uint16_t *)bq5_K->scales;
+    const int j  = bq8_offset/2;
+    const int jm = j & 1;
+
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
+
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+
     uint16_t aux[2];
-    const int j = bq8_offset/2;
-    if (j < 2) {
-        aux[0] = scales[j+0] & 0x3f3f;
-        aux[1] = scales[j+2] & 0x3f3f;
-    } else {
-        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
-        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
-    }
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
