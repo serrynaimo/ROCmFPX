@@ -36,6 +36,9 @@ weights) plus a server-side prompt cache on SSD.
   keyed by token content, so there is nothing to invalidate.
 - **Survives restarts.** Cache entries left by a previous run are adopted.
 - **Vision** through the f16 `mmproj`, including after a cache restore.
+- **A decision classifier on the same port.** A small pointer-head model
+  (TinyJev) answers typed yes/no, choice and score questions with calibrated
+  probabilities via `/v1/classifier`, on the CPU, beside the big model.
 - **Fails fast when busy.** `LLAMA_MAX_QUEUED=n` rejects requests once `n` are
   already waiting, so a client can fall back to another server.
 
@@ -113,6 +116,35 @@ Off unless `--cache-disk` is given. Everything else has a working default.
 | `--cache-disk-min-tokens N` | 2048 | shorter prompts (keep-alive pings, title requests) are never written. |
 
 Each flag also reads `LLAMA_ARG_CACHE_DISK[_...]` from the environment.
+
+## Decision classifier
+
+The same server also answers typed questions about a text with calibrated
+probabilities instead of generated text: the TypeSafe *System One* API, served
+by an open pointer-head decision model such as TinyJev. A request sends a
+`state` and a set of `choice`, `noul` (yes/no) or `score` questions and gets
+back a choice or score per question with its probabilities and confidence,
+behind the normal API key.
+
+```
+POST /v1/classifier            (alias: /v1/systemone)
+```
+
+Two ways to serve it:
+
+- **Native:** start `llama-server` with the pointer model's backbone as `-m`
+  plus `--classifier-head head.safetensors --classifier-config classifier.json`.
+  TinyJev-4B in BF16 on the CPU (`-dev none -ngl 0`) answers in ~450 ms and
+  leaves the GPU to the big model.
+- **Router:** run one `llama-server --models-preset models.ini` on the public
+  port with the big model and the classifier as children; classifier requests
+  go to the child started with `--classifier-head`, everything else to
+  `--models-default`. This is how the setup above runs in practice: one port,
+  one API key, both models.
+
+`--classifier-cache DIR` keeps answers on disk; a repeated question about the
+same state is served without a decode. Details, the config format and the
+response shape: [docs/classifier.md](docs/classifier.md).
 
 ## Speed at depth
 
