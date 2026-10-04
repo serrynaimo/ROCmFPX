@@ -1785,8 +1785,25 @@ std::thread server_child::setup(const std::function<void(int)> & shutdown_handle
             }
         }
         if (eof) {
-            SRV_INF("%s", "EOF on stdin detected, forcing shutdown...\n");
-            exit(1);
+            // Shut down the same way as on the exit command. exit(1) here ended the process with the
+            // model still allocated, and on Windows + HIP that exit does not finish: the process stays
+            // for tens of minutes with its exit code already set, one thread spinning and several GB
+            // of VRAM still allocated, so the next instance loads into a card that is partly taken and
+            // stays spilled into shared memory. Tools that skip "already exited" processes (PowerShell
+            // Stop-Process) never remove it; a real TerminateProcess clears it in 2 s.
+            // (RX 7900 XT, 27B: 4.7 GB still held 31 min after the router was killed; next load 4.8 GB shared)
+            SRV_INF("%s", "EOF on stdin detected, shutting down...\n");
+            // no router is left to enforce stop-timeout, so do not hang around if the shutdown stalls
+            std::thread([]() {
+                std::this_thread::sleep_for(std::chrono::seconds(30));
+                fprintf(stderr, "shutdown not finished 30 s after EOF on stdin, terminating\n");
+#ifdef _WIN32
+                TerminateProcess(GetCurrentProcess(), 1);   // not exit(): that is the call that hangs
+#else
+                std::_Exit(1);
+#endif
+            }).detach();
+            shutdown_handler(0);
         }
     });
 }
