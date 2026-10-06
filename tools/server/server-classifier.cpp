@@ -300,16 +300,15 @@ std::vector<llama_token> server_classifier::user_tokens(const std::string & text
 
 // decode `toks` as positions start.. of sequence 0 and return the captured hidden rows for the sorted positions `want`
 std::vector<float> server_classifier::decode_chunk(const std::vector<llama_token> & toks, int start, const std::vector<int> & want) {
-    llama_batch batch = llama_batch_init((int32_t) toks.size(), 0, 1);
+    common_batch batch(lctx);
     for (size_t i = 0; i < toks.size(); i++) {
         const int pos = start + (int) i;
-        common_batch_add(batch, toks[i], pos, { 0 }, std::binary_search(want.begin(), want.end(), pos));
+        batch.add(toks[i], pos, 0, std::binary_search(want.begin(), want.end(), pos));
     }
     captured.clear();
     captured_rows = 0;
-    const int rc = llama_decode(lctx, batch);
-    llama_batch_free(batch);
-    if (rc != 0) { throw std::runtime_error(string_format("llama_decode failed (%d)", rc)); }
+    const int rc = llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+    if (rc != 0) { throw std::runtime_error(string_format("llama_process failed (%d)", rc)); }
     if (captured_rows != (int64_t) want.size()) {
         throw std::runtime_error(string_format("captured %lld hidden rows, expected %zu", (long long) captured_rows, want.size()));
     }
