@@ -1770,6 +1770,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
                 p_top = cur_p->data[0].p;
+                if (dparams.at(seq_id).result_q) {
+                    dparams.at(seq_id).result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                }
                 }
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
                 auto & dp = dparams.at(seq_id);
@@ -1801,10 +1804,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_sampler_accept(smpl, id, true);
 
                 result.push_back(id);
-
-                if (dp.result_q) {
-                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
-                }
 
                 if (rocmfpx_cum_p <= 0.0f && params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
