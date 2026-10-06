@@ -1756,6 +1756,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const bool used_exact = direct_choice && candidate_vocabulary->unique_max(
                     llama_get_logits_ith(ctx_dft, i_last[seq_id]), id);
                 llama_token id_sampled = LLAMA_TOKEN_NULL;
+                std::vector<llama_token_data> q_row; // the drafted token's distribution, when the caller verifies by rejection
                 if (!used_exact) {
                 id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
 
@@ -1771,7 +1772,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
                 p_top = cur_p->data[0].p;
                 if (dparams.at(seq_id).result_q) {
-                    dparams.at(seq_id).result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                    q_row.assign(cur_p->data, cur_p->data + cur_p->size);
                 }
                 }
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
@@ -1804,6 +1805,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_sampler_accept(smpl, id, true);
 
                 result.push_back(id);
+                if (dp.result_q) {
+                    dp.result_q->push_back(std::move(q_row)); // one distribution per drafted token, always in step with result
+                }
 
                 if (rocmfpx_cum_p <= 0.0f && params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
@@ -3205,7 +3209,7 @@ void common_speculative_draft(common_speculative * spec) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
                 auto & dp = dparams[seq_id];
 
-                if (dp.prompt == nullptr || dp.result == nullptr || dp.result->empty()) {
+                if (dp.prompt == nullptr || dp.result == nullptr || dp.result->empty() || dp.result_q != nullptr) {
                     continue;
                 }
 

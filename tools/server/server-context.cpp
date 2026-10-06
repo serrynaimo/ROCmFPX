@@ -371,6 +371,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_q.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -3664,6 +3665,7 @@ private:
                                         n_past, slot.task->n_tokens());
                                 n_past = 0;
                                 slot.spec_draft.clear();
+                                slot.spec_draft_q.clear();
                                 slot.spec_i_batch.clear();
                                 slot.spec_ckpt.clear();
                                 common_speculative_set_state(spec.get(), slot.id, {});
