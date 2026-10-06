@@ -126,6 +126,41 @@ Each question is one pass with a single output row. The questions of a request s
 each question continues from a restored copy. More than 26 options are read in chunks whose winners meet in a final
 read.
 
+### Recommended model
+
+For a classifier that runs next to a chat model, on the CPU, we recommend the
+[StartLux-Decision](https://huggingface.co/startlux-models) models, and on AMD Ryzen CPUs their **BF16** files rather
+than Q8_0: on a AMD Ryzen 9 7900 12-Core Processor (12 threads) the BF16 file of StartLux-Decision-2B answers in about half the time of its
+Q8_0 file (a 21-option choice 1.05 s against 2.0 s, a yes/no question 0.39 s against 0.75 s), at 3.8 GB against 2.0 GB.
+
+Measured here on CPU, BF16, 12 threads: OpenDecision 500 and our own 115 requests (theme choice for a document, table
+and chat yes/no questions), with the latency weighted by how often we ask each kind.
+
+| Model | Family | OpenDecision 500 | Own requests | Latency |
+|---|---|---|---|---|
+| TinyJev-4B v1 | pointer | 476 | 105 | 0.86 - 0.89 s |
+| **StartLux-Decision-2B** | letter | 486 | 110 | 0.57 - 0.72 s |
+| Wald-4B v1.2 (plain prompt) | letter | 488 | 111 | 1.1 - 1.25 s |
+| Wald-4B v1.2 (its repeated-state prompt) | letter | 490 | 110 | 1.6 - 1.75 s |
+| TinyJev-4B v2 | letter, `ollama` | 490 | 110 | 1.9 s |
+
+StartLux-Decision-2B is the only one that is both faster and more accurate than the 4B pointer model; the larger
+ones gain a few OpenDecision cases for 1.5 to 3 times the latency. Its config:
+
+```json
+{"name": "startlux-decision-2b", "family": "letter",
+ "letter": {
+   "prompt": "<|im_start|>system\nApply the criterion to the evidence. Choose exactly one listed option. Answer with its letter only.<|im_end|>\n<|im_start|>user\nEvidence:\n{state}\n\nQuestion: {instructions}\nOptions:{options}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "empty_state": "(none)", "option_line": "\n{letter}) {text}", "variants": ["{letter}"],
+   "state_format": "json", "json_index_min": 8, "score_format": "{name}: {desc}", "true_first": true,
+   "noul_instructions": "Which answer fits the evidence?", "bare_keys": "bare", "same_as_name": true, "strip": true,
+   "temperature": {"noul": 2.2907, "choice": 1.5319, "score": 1.6163}}}
+```
+
+Two things to know: its probabilities are cautious (the shipped temperatures flatten them, so thresholds near 0 or 1
+are reached less often than with TinyJev v1), and the weights are CC BY-NC 4.0, so commercial use needs a licence
+from StartLux Labs. Wald-4B is the Apache-2.0 alternative.
+
 ## Related: `--gpu-keepalive-ms`
 
 Some Windows drivers evict an idle GPU's whole VRAM to system RAM seconds after it has no display work.
