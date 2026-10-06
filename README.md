@@ -10,35 +10,32 @@ weights) plus a server-side prompt cache on SSD.
 
 ## What it does well
 
-- **A 27B model with 80k context, entirely on a 20 GB card.** ROCmFP4 weights
-  (~15 GB) and a q4_0 KV cache: 18.9 GB at load, nothing paged to system RAM.
-- **Fast decode.** The model's own MTP head drafts four tokens ahead: ~48 t/s
-  on prose and ~75 t/s on code, against 35 t/s without it.
+- **A 27B model with 80k context on a 20 GB card.** ROCmFP4 weights (~15 GB)
+  and a q4_0 KV cache: 18.9 GB at load.
+- **Fast decode.** The model's own MTP head drafts four tokens ahead: 44 t/s
+  on prose and 65 t/s on code, against 34 t/s without it.
 - **Switching conversations costs seconds, not minutes.** Qwen3.8 is a hybrid
   (16 attention + 49 recurrent layers), and recurrent state cannot be rolled
   back to an arbitrary prefix, so stock llama.cpp re-prefills a conversation
   from scratch once another request has taken the slot. Here the conversation
   is written to SSD together with its checkpoints and restored when it returns:
 
-  | situation | stock | this runtime |
+  | situation | stock | this runtime, median (range) |
   |---|---|---|
-  | return to a 49.6k-token conversation after another agent used the slot | 110 s | **2 s** |
-  | new session with the same 23.5k system prompt + tools | 50 s | **0.8 s** |
-  | new session, system prompt differs near its end (a date line) | 50 s | 8 s |
-  | agent rewrote mid-history (compaction, pruned tool output) | 110 s | 39-55 s |
-  | first request after a server restart, 9.8k system prompt | 27 s | 0.5 s |
+  | return to a 40-53k-token conversation after another agent used the slot | 77-105 s | **2.9 s** (1.5-7.3) |
+  | new session with the same 12-24k system prompt + tools | 20-42 s | **0.7 s** (0.4-25) |
+  | prompt diverges from the cached one before its end, 25-34k | 45-62 s | 7.5 s (6.5-10) |
+  | first request after a server restart, 18-27k | 30-50 s | 4.2 s (1.0-10.9) |
 
 - **One slot serves several agents.** 20 GB holds exactly one full-size context;
   the cache is what makes `-np 1` workable for an orchestrator and its workers.
 - **Shared system prompts.** States are saved every 4096 tokens inside the
   system prompt + tools block and at its end. Any conversation that starts with
-  the same tokens resumes from the deepest state it still shares. Entries are
-  keyed by token content, so there is nothing to invalidate.
+  the same tokens resumes from the deepest state it still shares.
 - **Survives restarts.** Cache entries left by a previous run are adopted.
 - **Vision** through the f16 `mmproj`, including after a cache restore.
-- **A decision classifier on the same port.** A small pointer-head model
-  (TinyJev) answers typed yes/no, choice and score questions with calibrated
-  probabilities via `/v1/classifier`, on the CPU, beside the big model.
+- **A decision classifier on the same port**: typed yes/no, choice and score
+  answers with calibrated probabilities, from a small model on the CPU.
 - **Fails fast when busy.** `LLAMA_MAX_QUEUED=n` rejects requests once `n` are
   already waiting, so a client can fall back to another server.
 
@@ -50,11 +47,9 @@ been measured on an XTX.
 
 **1. Model.** `Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S` (~15 GB): ROCmFP4
 weights and the MTP head, with 61 sensitive tensors promoted to
-`Q6_0_ROCMFPX`, plus the f16 `mmproj` for vision. Swift 1.5 is UkisAI's
-Qwen3.8-27B fine-tune; run at `reasoning_effort: low` it solved our whole task
-set in the least wall time of any setting we measured. The
+`Q6_0_ROCMFPX`, plus the f16 `mmproj` for vision. The
 [recipe and its tensor policy file](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
-are in this repository; quantizing takes about 4 minutes on the CPU.
+are in this repository.
 
 **2. Build** (ROCm 7.2 clang, Ninja; about 3 minutes):
 
@@ -69,9 +64,6 @@ cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release ^
 cmake --build build-hip --target llama-server -j 12
 ```
 
-Leave `GGML_HIP_ROCWMMA_FATTN` **off**: for this model's head dimension (256)
-it is slower than the default attention kernel (325 vs 497 t/s at 16k).
-
 **3. Run:**
 
 ```
@@ -80,7 +72,7 @@ set GGML_CUDA_NO_PINNED=1
 set LLAMA_MAX_QUEUED=3
 
 llama-server -m Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S.gguf --mmproj mmproj-Qwen3.8-27B-f16.gguf ^
-  -dev ROCm0 -ngl 999 -fa on --jinja ^
+  -dev ROCm0 -ngl 999 -fa on --jinja --load-mode dio --gpu-keepalive-ms 2000 ^
   -c 81920 -np 1 -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -b 2048 -ub 256 ^
   --ctx-checkpoints 8 --checkpoint-min-step 2048 ^
   --cache-ram 0 --cache-disk D:\llama-cache --cache-disk-limit 65536 --cache-disk-checkpoints 4 ^
@@ -94,14 +86,49 @@ The server speaks the usual OpenAI-compatible API on `/v1`.
 
 | setting | why |
 |---|---|
-| `-c 81920`, q4_0 KV | the largest context that stays on a 20 GB card. KV costs ~18 KB/token (0.58 GiB per 32k). Past the card's limit Windows silently pages VRAM to system RAM: 96k costs <1% prefill, 112k 6%, **128k halves it**. A 24 GB XTX should reach ~4 GB further. |
+| `-c 81920`, q4_0 KV | about what a 20 GB card holds; KV costs ~18 KB/token. Whatever does not fit, Windows silently pages to system RAM. We run `-c 106496` in production with 1.9 GB paged. |
 | `-np 1` | one full-size context is all that fits; the SSD cache shares it between agents. |
 | `-ub 256` | the smallest compute buffer that keeps prefill speed; larger ones take VRAM from the context. |
-| MTP draft, `n-max 4` | 8-12% faster over a whole long session. 2 loses 20% decode, 6 gains nothing. |
-| `--ctx-checkpoints 8` | kept in host RAM, ~200 MiB each. When the list is full, the checkpoint whose removal leaves the smallest gap is dropped, so eight cover a whole 60k conversation. The one at the first user message is never dropped. |
+| MTP draft, `n-max 4` | +27% decode on prose, +90% on code, for 1.4 GB of VRAM and 9% of prefill speed. |
+| `--ctx-checkpoints 8` | kept in host RAM, ~200 MiB each. When the list is full, the one whose removal leaves the smallest gap is dropped; the one at the first user message never is. |
+| `--load-mode dio` | the default memory-mapped load keeps the 15 GB model file in system RAM. |
+| `--gpu-keepalive-ms 2000` | an idle card on a nearly full VRAM budget loses its resident memory and the next request crawls. |
 | `--no-reasoning-preserve` | otherwise the template keeps the thinking of every past turn: a permanent context tax. |
-| `GGML_CUDA_NO_PINNED=1` | pinned host memory doubles shared-memory creep for no speed gain. |
+| `GGML_CUDA_NO_PINNED=1` | pinned host memory makes more of the model page out, for no speed gain. |
 | `--temp 1` | Qwen3.8 degrades under greedy decoding. |
+
+## Speed
+
+Bench of 6 October 2026 at `-c 81920`: nine 450-token runs per decode row, one
+cold prompt per depth.
+
+| t/s | median | peak |
+|---|---:|---:|
+| decode, prose | 43.8 | 47.8 |
+| decode, code | 65.3 | 74.5 |
+| decode without MTP, prose or code | 34.4 | 34.4 |
+
+| cold prompt | 18k | 45k | 74k |
+|---|---:|---:|---:|
+| prefill t/s, average over the prompt | 580 | 516 | 455 |
+| decode t/s at that depth | 43.2 | 35.9 | 34.3 |
+
+Production traffic, 2-6 October 2026 (718 agent requests at `-c 106496`), by
+context depth; requests generating 200+ tokens (decode) or evaluating 1,500+
+(prefill). The cache table above comes from the same log, with "stock" being
+a cold prefill at these speeds.
+
+| context depth | decode median | decode peak | prefill median | prefill peak |
+|---|---:|---:|---:|---:|
+| under 8k | 63.5 | 70.3 | 333 | 451 |
+| 8-20k | 47.1 | 67.0 | 536 | 608 |
+| 20-40k | 43.4 | 66.3 | 495 | 571 |
+| 40-60k | 41.5 | 51.9 | 414 | 465 |
+| 60-80k | 33.3 | 40.2 | 420 | 436 |
+| all | 43.7 | 70.3 | 500 | 608 |
+
+The slope is attention over the growing KV cache; the recurrent layers cost
+the same at any depth. The first and last rows rest on 3-14 requests each.
 
 ## The SSD prompt cache
 
@@ -110,69 +137,32 @@ Off unless `--cache-disk` is given. Everything else has a working default.
 | flag | default | meaning |
 |---|---|---|
 | `--cache-disk PATH` | off | cache directory. Put it on an NVMe. |
-| `--cache-disk-limit N` | 8192 | size limit in MiB; least recently used entries go first. A 50k-token entry is ~250 MB plus ~200 MB per checkpoint. |
-| `--cache-disk-checkpoints N` | -1 (all) | checkpoints written with each entry, newest first. More checkpoints let a prompt that diverges mid-history resume closer to the divergence. |
+| `--cache-disk-limit N` | 8192 | size limit in MiB; least recently used entries go first. A 16k-token entry is ~0.65 GB with one checkpoint, a 45k-token one ~1.8 GB with four. |
+| `--cache-disk-checkpoints N` | -1 (all) | checkpoints written with each entry, newest first. More let a prompt that diverges mid-history resume closer to the divergence. |
 | `--cache-disk-prefix-step N` | 4096 | spacing of the shared system-prompt entries; 0 disables them. |
 | `--cache-disk-min-tokens N` | 2048 | shorter prompts (keep-alive pings, title requests) are never written. |
 
 Each flag also reads `LLAMA_ARG_CACHE_DISK[_...]` from the environment.
 
+- **The cache directory must not be NTFS-compressed** (fix with
+  `compact /U /S:<dir>`): compression caps an NVMe at ~140 MB/s, against
+  ~1.4 GB/s without (a 1.8 GB entry saves in 1.3 s and restores in 0.8 s).
+- **Age-based cleanup of the directory is safe.** The server refreshes a
+  file's timestamp whenever it uses it.
+- **Make the agent rewrite history as little as possible.** Every rewrite is a
+  cache break: set its compaction trigger well below the context size.
+  Auxiliary calls (titles, summaries, vision) take the slot too; the cache
+  makes that cheap, not free.
+
 ## Decision classifier
 
-The same server also answers typed questions about a text with calibrated
-probabilities instead of generated text: the TypeSafe *System One* API, served
-by an open pointer-head decision model such as TinyJev. A request sends a
-`state` and a set of `choice`, `noul` (yes/no) or `score` questions and gets
-back a choice or score per question with its probabilities and confidence,
-behind the normal API key.
-
-```
-POST /v1/classifier            (alias: /v1/systemone)
-```
-
-Two ways to serve it:
-
-- **Native:** start `llama-server` with the pointer model's backbone as `-m`
-  plus `--classifier-head head.safetensors --classifier-config classifier.json`.
-  TinyJev-4B in BF16 on the CPU (`-dev none -ngl 0`) answers in ~450 ms and
-  leaves the GPU to the big model.
-- **Router:** run one `llama-server --models-preset models.ini` on the public
-  port with the big model and the classifier as children; classifier requests
-  go to the child started with `--classifier-head`, everything else to
-  `--models-default`. This is how the setup above runs in practice: one port,
-  one API key, both models.
-
-`--classifier-cache DIR` keeps answers on disk; a repeated question about the
-same state is served without a decode. Details, the config format and the
-response shape: [docs/classifier.md](docs/classifier.md).
-
-## Speed at depth
-
-Prefill ~650 t/s at the start of a context, ~460 at 20k, ~330 at 46k, ~245 at
-80k; decode ~48 t/s shallow, ~29 at 55k. The slope is attention over the
-growing KV cache - the recurrent layers cost the same at any depth - so an
-agent that keeps its sessions at 20-40k runs markedly faster than one that
-lives at 60k.
-
-## Operating it
-
-- **The cache directory must not be NTFS-compressed** (check
-  `(Get-Item <dir>).Attributes`; fix with `compact /U /S:<dir>`). Compression
-  caps a Gen4 NVMe at ~140 MB/s for no space gain: a 50k-token save takes 11 s
-  instead of 1.7 s.
-- **Age-based cleanup of the cache directory is safe.** The server refreshes a
-  file's timestamp whenever it uses it, so "older than N hours" means unused.
-- **Keep the process warm.** Windows demotes an idle process's VRAM on a nearly
-  full card and the next request crawls. A one-token request every 5 minutes of
-  idle keeps it resident.
-- **Free the VRAM the desktop holds.** Hardware-accelerated apps and an open
-  RDP session take 1-3 GB, which pushes the model into system RAM. Spilled
-  memory is only reclaimed by restarting the server.
-- **Make the agent rewrite history as little as possible.** Every rewrite is a
-  cache break. Set the agent's compaction trigger well below the context size
-  and make sure one compaction frees enough that the next is far away. Auxiliary
-  calls (titles, summaries, vision) on the same server take the slot too; the
-  cache makes that cheap, not free.
+`POST /v1/classifier` answers typed `choice`, `noul` (yes/no) and `score`
+questions about a text with calibrated probabilities instead of generated
+text, from an open decision model such as StartLux-Decision. Start a server
+with that model and `--classifier-config`, or run it as a child of a router
+(`--models-preset`) next to the big model: one port, one API key, both models.
+On the CPU (`-dev none -ngl 0`) StartLux-Decision-2B BF16 answers a yes/no
+question in 0.4 s. Details: [docs/classifier.md](docs/classifier.md).
 
 ---
 

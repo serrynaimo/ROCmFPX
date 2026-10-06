@@ -86,14 +86,14 @@ Perplexity, wikitext-2 test, 580 chunks, `-c 512 -b 512 -fa on`, f16 KV:
 | --- | ---: | ---: |
 | `MQ-Q4S` (61 tensors) | 7.1516 ± 0.048 | 14.97 |
 
-Speed and memory, served with `-c 92160`, q4_0 KV, MTP draft `n-max 4`,
-`-ub 256`, with the vision `mmproj` loaded:
+Speed and memory, served with `-c 81920`, q4_0 KV, MTP draft `n-max 4`,
+`-ub 256`, with the vision `mmproj` loaded (6 October 2026):
 
 | measure | value |
 | --- | ---: |
-| prose decode, MTP, tok/s | 42.7 |
-| prefill at 20k / 50k, tok/s | 561 / 453 |
-| VRAM after a 50k prefill, GB | 17.95 dedicated + 1.32 shared |
+| prose / code decode, MTP, tok/s, median (peak) | 43.8 (47.8) / 65.3 (74.5) |
+| prefill of a cold 18k / 45k / 74k prompt, tok/s | 580 / 516 / 455 |
+| VRAM after a 45k prefill, GB | 18.11 dedicated + 0.89 shared |
 
 Reasoning effort, 50 runs per setting (4 tool-calling agentic tasks x 3,
 10 reasoning tasks x 2, 9 harder python-verified tasks x 2, temperature 1,
