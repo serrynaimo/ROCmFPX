@@ -2052,7 +2052,8 @@ void server_models_routes::init_routes() {
             std::string cls;
             for (const auto & meta : models.get_all_meta()) {
                 std::string head;
-                if (meta.preset.get_option("LLAMA_ARG_CLASSIFIER_HEAD", head) && !head.empty()) {
+                if ((meta.preset.get_option("LLAMA_ARG_CLASSIFIER_HEAD", head) && !head.empty()) ||
+                    (meta.preset.get_option("LLAMA_ARG_CLASSIFIER_CONFIG", head) && !head.empty())) {
                     cls = meta.name;
                     break;
                 }

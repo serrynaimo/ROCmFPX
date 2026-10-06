@@ -85,6 +85,47 @@ llama-server -m TinyJev-4B-BF16.gguf -dev none -ngl 0 -c 4096 -np 1 -fa on -t 12
   --classifier-head head.safetensors --classifier-config classifier.json --host 127.0.0.1 --port 8077
 ```
 
+### Letter family (no head)
+
+Many newer decision models (Wald, StartLux-Decision, decider, TinyJev v2) have no head: the options are lettered in
+a text prompt and the answer is the model's own next-token logits of those letters. `"family": "letter"` in the
+config serves them; `--classifier-config` alone enables it, there is no `--classifier-head`.
+
+```
+llama-server -m Wald-4B-v1.2-Q8_0.gguf --classifier-config classifier.json -dev none -ngl 0 -c 8192
+```
+
+```json
+{"name": "wald-4b", "family": "letter",
+ "letter": {
+   "prompt": "State:\n{state}\n\nQuestion: {instructions}{options}\nAnswer: (",
+   "prompt_no_state": "Question: {instructions}{options}\nAnswer: (",
+   "option_line": "\n({letter}) {text}",
+   "variants": ["{letter}", " {letter}"],
+   "bare_keys": "positional",
+   "temperature": {"choice|2": 1.19, "choice|3-4": 1.74, "noul|2": 1.32, "default": 1.37}}}
+```
+
+| Key | Meaning |
+|---|---|
+| `prompt` | the whole prompt of one question; `{state}` may appear twice. Special tokens written here (a chat template) are parsed, user text is escaped |
+| `prompt_no_state`, `empty_state` | for a blank state: another prompt, or the text that stands in for the state |
+| `option_line` | one option, `{letter}` is A, B, .. |
+| `variants` | token spellings of a letter whose probabilities are added |
+| `state_format` | `text` (labelled lines, as the pointer family) or `json` (compact JSON; `json_index_min` adds `_index` to the items of long arrays) |
+| `score_format`, `true_first`, `noul_instructions`, `same_as_name`, `strip` | how levels and yes/no are written |
+| `bare_keys` | choice keys that only number the options: `positional` drops a leading `a: `, `bare` shows the description alone |
+| `temperature` | a number, or a map looked up as `<type>\|<bucket>` (option count 2, 3-4, 5-8, 9+), `<type>`, `default` |
+
+`"style": "ollama"` (TinyJev v2) replaces the option lines by the user message of Ollama's decision API: compact
+JSON with the state and the schema of every question, then `Requested field: "<name>"`. `prompt` wraps it as
+`{user}`, normally in the model's chat template with the Modelfile's system text.
+
+Each question is one pass with a single output row. The questions of a request share their common token prefix
+(the state; with `"style": "ollama"` the whole schema as well): it is decoded once, the sequence state is saved, and
+each question continues from a restored copy. More than 26 options are read in chunks whose winners meet in a final
+read.
+
 ## Related: `--gpu-keepalive-ms`
 
 Some Windows drivers evict an idle GPU's whole VRAM to system RAM seconds after it has no display work.

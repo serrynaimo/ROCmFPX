@@ -378,13 +378,14 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
 
     // Jev-style classifier routes (POST /v1/classifier, /v1/systemone), in one of two modes:
     //  - router:  proxied to the child named by the request's "model" (e.g. a CPU child with --classifier-head)
-    //  - native:  --classifier-head: this server's own model answers (server-classifier.cpp), created after load_model
+    //  - native:  --classifier-head, or --classifier-config alone for a family without a head: this server's own model
+    //             answers (server-classifier.cpp), created after load_model
     // In every mode the API key middleware has already run.
     std::shared_ptr<server_classifier> classifier;   // native mode, set once the model is loaded
     if (is_router_server) {
         ctx_http.post("/v1/classifier", ex_wrapper(models_routes->proxy_post_classifier));
         ctx_http.post("/v1/systemone",  ex_wrapper(models_routes->proxy_post_classifier));
-    } else if (!params.classifier_head.empty()) {
+    } else if ((!params.classifier_head.empty() || !params.classifier_config.empty())) {
         server_http_context::handler_t native_h = [&classifier](const server_http_req & req) -> server_http_res_ptr {
             auto res = std::make_unique<server_http_res>();
             auto err = [&](int status, const std::string & type, const std::string & msg) {
@@ -549,7 +550,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
             return 1;
         }
 
-        if (!params.classifier_head.empty()) {
+        if ((!params.classifier_head.empty() || !params.classifier_config.empty())) {
             auto cls = std::make_shared<server_classifier>();
             std::string err;
             if (!cls->init(const_cast<llama_model *>(llama_get_model(ctx_server.get_llama_context())), params, err)) {
