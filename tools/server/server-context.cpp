@@ -1339,6 +1339,12 @@ private:
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
 
+        if (kv_pool_shared()) {
+            SRV_INF("shared KV pool of %d tokens: a request starts beside running ones only if all of them fit, "
+                    "with %d tokens of generation room each; otherwise it waits\n",
+                    kv_pool_size(), params_base.kv_unified_reserve);
+        }
+
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
@@ -1681,6 +1687,230 @@ private:
         return nullptr;
     }
 
+    //
+    // shared KV pool [TAG_KV_POOL]
+    //
+    // With a unified KV cache every slot draws from one pool of n_ctx cells and each slot may grow
+    // up to the whole pool, so two running requests can need more cells between them than exist.
+    // decode() then fails, reports "Context size has been exceeded" to every processing slot and
+    // clears all of their contexts. The functions below keep the pool from being overcommitted:
+    //   - a request that does not fit beside the running ones waits in the deferred queue and
+    //     starts when one of them finishes (kv_pool_must_wait)
+    //   - an idle slot that has to give up its cells is saved to the prompt cache first, so its
+    //     conversation is restored instead of re-processed (kv_pool_make_room, try_clear_idle_slots)
+    //   - requests grow while they generate. When one outgrows the room set aside for it, an idle
+    //     slot gives up its cells before the pool is full (kv_pool_keep_headroom); with no idle
+    //     slot left, one of the running requests ends like a request that reached its context
+    //     limit and the others carry on (kv_pool_should_stop)
+    //
+
+    // free cells left when kv_pool_keep_headroom() and kv_pool_should_stop() step in: more than
+    // the running slots can add (sampled + draft tokens) in the decode steps until that has taken effect
+    static constexpr int32_t KV_POOL_MARGIN = 256;
+
+    bool kv_pool_shared() const {
+        return params_base.kv_unified && params_base.kv_unified_reserve > 0 && params_base.n_parallel > 1;
+    }
+
+    int32_t kv_pool_size() const {
+        return (int32_t) llama_n_ctx(ctx_tgt);
+    }
+
+    // cells a slot holds, or will hold once the prompt of its task is loaded
+    // (a prompt that is too large for the slot is refused and never loaded)
+    static int32_t kv_pool_claim(const server_slot & slot) {
+        int32_t res = slot.prompt.n_tokens();
+
+        if (slot.is_processing() && slot.task && slot.task->n_tokens() < slot.n_ctx) {
+            res = std::max(res, slot.task->n_tokens());
+        }
+
+        return res;
+    }
+
+    // generation room set aside for a request that may still produce n_predict_left tokens (-1 = no limit)
+    int32_t kv_pool_reserve(int32_t n_predict_left) const {
+        const int32_t res = params_base.kv_unified_reserve;
+
+        return n_predict_left < 0 ? res : std::min(res, n_predict_left);
+    }
+
+    int32_t kv_pool_reserve(const server_task & task) const {
+        return kv_pool_reserve(task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict);
+    }
+
+    int32_t kv_pool_reserve(const server_slot & slot) const {
+        return kv_pool_reserve(slot.n_predict_max == -1 ? -1 : std::max(0, slot.n_remaining()));
+    }
+
+    // true if the task has to wait: it does not fit into the pool beside the requests that are running
+    bool kv_pool_must_wait(const server_task & task) const {
+        if (!kv_pool_shared()) {
+            return false;
+        }
+
+        int32_t n_busy      = 0;
+        int32_t n_committed = 0;
+
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                n_busy++;
+                n_committed += kv_pool_claim(slot) + kv_pool_reserve(slot);
+            }
+        }
+
+        if (n_busy == 0) {
+            // nothing to wait for: idle slots make room, and a request that is too large for
+            // the pool on its own is refused when its prompt is processed
+            return false;
+        }
+
+        // the margin is part of what has to fit: a pair admitted without it would be stopped
+        // by kv_pool_should_stop() before using the room it was admitted for
+        const int32_t n_need = task.n_tokens() + kv_pool_reserve(task) + KV_POOL_MARGIN;
+
+        if (n_committed + n_need <= kv_pool_size()) {
+            return false;
+        }
+
+        SRV_INF("request waits for a running one to finish: it needs %d tokens (prompt %d + room to generate), "
+                "%d running request(s) hold %d of the %d-token pool, id_task = %d\n",
+                n_need, task.n_tokens(), n_busy, n_committed, kv_pool_size(), task.id);
+
+        return true;
+    }
+
+    // save an idle slot to the prompt cache and give its cells back to the pool
+    void kv_pool_evict(server_slot & slot) {
+        GGML_ASSERT(!slot.is_processing());
+
+        const int64_t t_start  = ggml_time_us();
+        const int     n_tokens = slot.prompt.n_tokens();
+
+        bool saved = false;
+        if (prompt_cache) {
+            saved = slot.prompt_save(*prompt_cache);
+            if (saved) {
+                prompt_cache->update();
+            }
+        }
+
+        slot.prompt_clear();
+
+        SRV_INF("cleared idle slot %d to make room in the KV cache: %d tokens, %s (%.0f ms)\n",
+                slot.id, n_tokens, saved ? "saved to the prompt cache" : "not saved",
+                (ggml_time_us() - t_start) / 1000.0);
+    }
+
+    // clear idle slots, least recently used first, until the task fits into `slot` beside the
+    // other slots. Done before the task starts, so that a prompt cache restore finds free cells
+    // and no running request has to stall for the save.
+    void kv_pool_make_room(const server_slot & slot, const server_task & task) {
+        if (!kv_pool_shared()) {
+            return;
+        }
+
+        if (task.n_tokens() >= slot.n_ctx) {
+            return; // refused when its prompt is processed: nothing to make room for
+        }
+
+        const int32_t n_need = task.n_tokens() + kv_pool_reserve(task) + KV_POOL_MARGIN;
+
+        while (true) {
+            int32_t n_others = 0;
+
+            server_slot * victim = nullptr;
+
+            for (auto & other : slots) {
+                if (other.id == slot.id) {
+                    continue;
+                }
+
+                if (other.is_processing()) {
+                    n_others += kv_pool_claim(other) + kv_pool_reserve(other);
+                } else if (other.prompt.n_tokens() > 0) {
+                    n_others += other.prompt.n_tokens();
+
+                    if (victim == nullptr || other.t_last_used < victim->t_last_used) {
+                        victim = &other;
+                    }
+                }
+            }
+
+            if (victim == nullptr || n_others + n_need <= kv_pool_size()) {
+                break;
+            }
+
+            kv_pool_evict(*victim);
+        }
+    }
+
+    // called before each decode. A running request may outgrow the room set aside for it; while an
+    // idle slot still holds cells, that slot is saved and cleared as soon as the cells in use come
+    // within KV_POOL_MARGIN of the pool. The pool is never run to its last cell: there a draft
+    // decode fails first (it has no retry), and the decode retry with a halved batch can split a
+    // sampled token from its draft ("speculative batch index N is not inside the current sub-batch")
+    void kv_pool_keep_headroom() {
+        if (!kv_pool_shared()) {
+            return;
+        }
+
+        while (true) {
+            int32_t n_held = 0;
+
+            server_slot * victim = nullptr;
+
+            for (auto & slot : slots) {
+                n_held += kv_pool_claim(slot);
+
+                if (!slot.is_processing() && slot.prompt.n_tokens() > 0 &&
+                        (victim == nullptr || slot.t_last_used < victim->t_last_used)) {
+                    victim = &slot;
+                }
+            }
+
+            if (victim == nullptr || n_held + KV_POOL_MARGIN < kv_pool_size()) {
+                break;
+            }
+
+            kv_pool_evict(*victim);
+        }
+    }
+
+    // true if `slot` should stop generating because the running requests are about to fill the
+    // pool. Of the generating slots the one with the least output so far is chosen: least is lost,
+    // and its client gets a regular truncated ("length") finish instead of an error.
+    bool kv_pool_should_stop(const server_slot & slot) const {
+        if (!kv_pool_shared()) {
+            return false;
+        }
+
+        int32_t n_busy = 0;
+        int32_t n_held = 0;
+
+        const server_slot * victim = nullptr;
+
+        for (const auto & other : slots) {
+            if (!other.is_processing()) {
+                continue;
+            }
+
+            n_busy++;
+            n_held += kv_pool_claim(other);
+
+            if (other.state == SLOT_STATE_GENERATING && (victim == nullptr || other.stats.n_gen < victim->stats.n_gen)) {
+                victim = &other;
+            }
+        }
+
+        // a lone request may use the whole pool: idle slots are cleared for it and it ends at slot.n_ctx
+        if (n_busy < 2 || n_held + KV_POOL_MARGIN < kv_pool_size()) {
+            return false;
+        }
+
+        return victim == &slot;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1804,6 +2034,11 @@ private:
             }
         }
 
+        if (ret && !ret->is_processing()) {
+            // [TAG_KV_POOL] before a prompt cache restore below needs the cells
+            kv_pool_make_room(*ret, task);
+        }
+
         if (ret) {
             update_cache = update_cache && prompt_cache;
 
@@ -1839,35 +2074,32 @@ private:
     }
 
     // return true if at least one slot has been cleared
-    // TODO: improve logic
-    //       - smarter decision which slot to clear (LRU or longest prompt?)
-    //       - move slot to level 2 cache instead of removing?
-    //       - instead of purging, try to store and resume later?
+    // called when a decode finds no free cells: the least recently used idle slot is saved to the
+    // prompt cache and cleared [TAG_KV_POOL]. slots are cleared one by one
     bool try_clear_idle_slots() {
-        bool res = false;
-
         if (!params_base.kv_unified) {
-            return res;
+            return false;
         }
 
+        server_slot * victim = nullptr;
+
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
                 continue;
             }
 
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
-
-                slot.prompt_clear();
-
-                res = true;
-
-                // clear slots one by one
-                break;
+            if (victim == nullptr || slot.t_last_used < victim->t_last_used) {
+                victim = &slot;
             }
         }
 
-        return res;
+        if (victim == nullptr) {
+            return false;
+        }
+
+        kv_pool_evict(*victim);
+
+        return true;
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -2075,6 +2307,16 @@ private:
 
             SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_gen = %d, n_ctx = %d\n",
                     slot.prompt.n_tokens(), slot.task->n_tokens(), (int) slot.stats.n_gen, slot.n_ctx);
+        }
+
+        // [TAG_KV_POOL] the same for the pool that the slots share
+        if (slot.has_next_token && kv_pool_should_stop(slot)) {
+            slot.truncated      = true;
+            slot.stop           = STOP_TYPE_LIMIT;
+            slot.has_next_token = false;
+
+            SLT_WRN(slot, "stopped: the running requests fill the shared KV pool of %d tokens, prompt.n_tokens() = %d, n_gen = %d\n",
+                    kv_pool_size(), slot.prompt.n_tokens(), (int) slot.stats.n_gen);
         }
 
         // check the limits
@@ -2623,6 +2865,13 @@ private:
 
                     const int id_task = task.id;
 
+                    // [TAG_KV_POOL] checked before a slot is picked: picking one already saves,
+                    // restores and clears prompt cache state for the task
+                    if (kv_pool_must_wait(task)) {
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
                     server_slot * slot = get_available_slot(task);
 
                     //
@@ -3058,6 +3307,9 @@ private:
                 queue_tasks.post(std::move(task));
             }
         }
+
+        // [TAG_KV_POOL]
+        kv_pool_keep_headroom();
 
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);

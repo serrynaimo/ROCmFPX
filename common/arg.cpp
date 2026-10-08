@@ -1659,6 +1659,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED_PER_SLOT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        { "--kv-unified-reserve" }, "N",
+        string_format(
+            "with --kv-unified and several slots: generation room in tokens kept free for each running request.\n"
+            "a request that does not fit beside the running ones waits for one of them to finish instead of\n"
+            "overflowing the shared KV pool (default: %d, 0 = start a request whenever a slot is free)",
+            params.kv_unified_reserve),
+        [](common_params & params, int value) {
+            params.kv_unified_reserve = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_KV_UNIFIED_RESERVE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION
