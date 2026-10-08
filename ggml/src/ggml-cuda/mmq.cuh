@@ -224,7 +224,7 @@ struct ggml_cuda_mmq_config {
         static_assert((nthreads_) %  32 == 0 && (nthreads_)       <= 512, "bad nthreads");                                                \
         static_assert(                          (occupancy_)      <=   8, "bad occupancy");                                               \
         static_assert((I_)        %  32 == 0,                             "bad I");                                                       \
-        static_assert((J_)        %   8 == 0,                             "bad J");                                                       \
+        static_assert((J_)        %   8 == 0 && (J_)              <= 128, "bad J");                                                       \
         static_assert((K_vram_)   % 256 == 0,                             "bad K_vram");                                                  \
         return ggml_cuda_mmq_config((type_), (nthreads_), (occupancy_), (I_), (J_), (sram_layout_), (K_vram_), (stream_k_), (fallback_)); \
     }                                                                                                                                     \
@@ -311,6 +311,8 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
     GGML_UNUSED_VARS(type, J, fallback, prec_src1);
 }
 
+// FIXME all of the host functions are missing prec_src1, this can lead to inconsitent behavior.
+
 static __host__ int ggml_cuda_mmq_get_type(const ggml_type type, const int J, const bool fallback, const int cc) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc).type;
 }
@@ -385,15 +387,8 @@ static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, in
     return ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_get_sram_layout(type, J, fallback, prec_src1));
 }
 
-static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fallback, const int cc, const int64_t ne11) {
-    int ret = std::min(ne11, int64_t(512));
-    ret -= ret % 8;
-    for (;ret > 0; ret -= 8) {
-        if (ggml_cuda_mmq_get_config(type, ret, fallback, cc).type != GGML_TYPE_COUNT) {
-            return ret;
-        }
-    }
-    return ret;
+static __host__ bool ggml_cuda_mmq_needs_fallback(const int64_t nrows_x) {
+    return nrows_x % 128 != 0;
 }
 
 static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, int J, bool fallback) {
@@ -1582,19 +1577,34 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
-    int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
+    int J_best; // Tile width in ne11(dense)/ne12(MoE) direction to use for optimal performance.
 };
 
-static bool fork_compact_supported(const mmq_args & a, bool fallback, int cc) {
-    const bool type_ok = (a.type_x == GGML_TYPE_IQ4_NL ||
-                          a.type_x == GGML_TYPE_Q4_0_ROCMI4 ||
-                          a.type_x == GGML_TYPE_Q4_0_ROCMFP4_FAST ||
-                          a.type_x == GGML_TYPE_Q4_K);
+// Shape predicate for the routed compact MoE kernel, callable from the caller (mmq.cu) before mmq_args exist,
+// so that the src1/ids padding is computed from the tile width that is actually launched.
+static bool fork_compact_supported_shape(ggml_type type_x, bool fallback, int cc, bool routed,
+        int64_t ncols_x, int64_t nrows_x, int64_t nchannels_x, int64_t nchannels_y, int64_t nsamples_x, int64_t nsamples_y,
+        int64_t ncols_dst, int64_t ncols_max) {
+    const bool type_ok = (type_x == GGML_TYPE_IQ4_NL ||
+                          type_x == GGML_TYPE_Q4_0_ROCMI4 ||
+                          type_x == GGML_TYPE_Q4_0_ROCMFP4_FAST ||
+                          type_x == GGML_TYPE_Q4_K);
     return type_ok && GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback &&
-        a.ids_dst != nullptr && a.expert_bounds != nullptr && a.nchannels_x == 512 && a.nchannels_y == 512 &&
-        a.nsamples_x == 1 && a.nsamples_y == 1 && a.ncols_max >= 16 && a.ncols_max <= 32768 &&
-        a.ncols_dst == a.ncols_max * 10 &&
-        ((a.ncols_x == 2560 && a.nrows_x == 640) || (a.ncols_x == 640 && a.nrows_x == 2560));
+        routed && nchannels_x == 512 && nchannels_y == 512 &&
+        nsamples_x == 1 && nsamples_y == 1 && ncols_max >= 16 && ncols_max <= 32768 &&
+        ncols_dst == ncols_max * 10 &&
+        ((ncols_x == 2560 && nrows_x == 640) || (ncols_x == 640 && nrows_x == 2560));
+}
+
+static bool fork_compact_supported(const mmq_args & a, bool fallback, int cc) {
+    return fork_compact_supported_shape(a.type_x, fallback, cc, a.ids_dst != nullptr && a.expert_bounds != nullptr,
+        a.ncols_x, a.nrows_x, a.nchannels_x, a.nchannels_y, a.nsamples_x, a.nsamples_y, a.ncols_dst, a.ncols_max);
+}
+
+// Tile width used by the routed compact kernel for a given mean number of rows per expert.
+static int fork_compact_J(int64_t ncols_dst, int64_t nchannels_y) {
+    const int64_t mean_rows = (ncols_dst + nchannels_y - 1) / nchannels_y;
+    return mean_rows <= 12 ? 16 : mean_rows <= 32 ? 48 : mean_rows <= 64 ? 64 : 128;
 }
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1704,42 +1714,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
 template <ggml_type type, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8>
 void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
-    const int    id    = ggml_cuda_get_device();
-    const int    cc    = ggml_cuda_info().devices[id].cc;
-    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
-
-    int J_best        = 0;
-    int ntiles_J_best = INT_MAX;
-
-    if (fork_compact_supported(args, fallback, cc)) {
-        const int64_t mean_rows = (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y;
-        const int j = mean_rows <= 12 ? 16 : mean_rows <= 32 ? 48 : mean_rows <= 64 ? 64 : 128;
-        GGML_ASSERT(j == 16 || j == 32 || j == 48 || j == 64 || j == 128);
-        const auto config = ggml_cuda_mmq_get_config(type, j, fallback, cc);
-        GGML_ASSERT(config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo);
-        J_best = j;
-        ntiles_J_best = 1;
-    }
-
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
-        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
-        if (config.type == GGML_TYPE_COUNT) {
-            continue;
-        }
-
-        if (mmq_get_nbytes_shared(config, cc) > smpbo) {
-            continue;
-        }
-
-        const int ntiles_x = (args.ncols_opt + config.J - 1) / config.J;
-
-        if (ntiles_x < ntiles_J_best) {
-            J_best = J;
-            ntiles_J_best = ntiles_x;
-        }
-    }
-
-    switch (J_best) {
+    switch (args.J_best) {
         case   8:
             launch_mul_mat_q<type,   8, fallback, prec_src1>(ctx, args, stream);
             break;
@@ -1789,18 +1764,18 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             launch_mul_mat_q<type, 128, fallback, prec_src1>(ctx, args, stream);
             break;
         default:
-            GGML_ABORT("unsupported J_best=%d", J_best);
+            GGML_ABORT("unsupported J_best=%d", args.J_best);
             break;
     }
 }
 
 template <ggml_type type, ggml_prec prec_src1 = GGML_PREC_Q8>
 void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
-    if (args.nrows_x % 128 == 0) {
-        constexpr bool fallback = false;
+    if (ggml_cuda_mmq_needs_fallback(args.nrows_x)) {
+        constexpr bool fallback = true;
         mul_mat_q_switch_J<type, fallback, prec_src1>(ctx, args, stream);
     } else {
-        constexpr bool fallback = true;
+        constexpr bool fallback = false;
         mul_mat_q_switch_J<type, fallback, prec_src1>(ctx, args, stream);
     }
 }
