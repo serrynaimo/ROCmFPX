@@ -799,6 +799,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // quantized-KV f16 temp path. Route small decode/speculative batches through
     // VEC, which dequantizes inline and avoids capture-unsafe allocation calls.
     // Large prefill batches still fall through to the faster TILE/MMA path.
+    // [TAG_FATTN_TILE_Q4_0] decode-sized batches on a q4_0 cache with head size 256: the tile kernel expands its own
+    // K/V tiles and loads them once per GQA group. GGML_HIP_FA_Q4_TILE_MIN / _MAX bound the batch sizes (0 = off).
+    {
+        static const int q4_tile_min = getenv("GGML_HIP_FA_Q4_TILE_MIN") ? atoi(getenv("GGML_HIP_FA_Q4_TILE_MIN")) : 1;
+        static const int q4_tile_max = getenv("GGML_HIP_FA_Q4_TILE_MAX") ? atoi(getenv("GGML_HIP_FA_Q4_TILE_MAX")) : 8;
+        if (ggml_cuda_fattn_tile_reads_q4_0(dst) && gqa_opt_applies && q4_tile_min > 0 &&
+                Q->ne[1] >= q4_tile_min && Q->ne[1] <= q4_tile_max) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
+    }
+
     if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && can_use_vector_kernel && Q->ne[1] <= 8) {
         return BEST_FATTN_KERNEL_VEC;
     }
@@ -914,6 +925,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+            // [TAG_FATTN_TILE_Q4_0] no f16 copy of the cache when the tile kernel reads q4_0 itself
+            need_f16_K = !ggml_cuda_fattn_tile_reads_q4_0(dst);
+            need_f16_V = !ggml_cuda_fattn_tile_reads_q4_0(dst);
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
