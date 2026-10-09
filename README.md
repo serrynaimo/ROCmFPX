@@ -12,8 +12,8 @@ weights) plus a server-side prompt cache on SSD.
 
 - **A 27B model with 80k context on a 20 GB card.** ROCmFP4 weights (~15 GB)
   and a q4_0 KV cache: 18.9 GB at load.
-- **Fast decode.** The model's own MTP head drafts four tokens ahead: 54 t/s
-  on prose against 35 t/s without it, and 51 t/s with 41k tokens of history.
+- **Fast decode.** The model's own MTP head drafts four tokens ahead: 50 t/s
+  on prose and 73 t/s on code, against 35 t/s without it.
 - **Switching conversations costs seconds, not minutes.** Qwen3.8 is a hybrid
   (16 attention + 49 recurrent layers), and recurrent state cannot be rolled
   back to an arbitrary prefix, so stock llama.cpp re-prefills a conversation
@@ -102,7 +102,7 @@ The server speaks the usual OpenAI-compatible API on `/v1`.
 | `--no-cache-idle-slots` | keeps the idle conversation resident; the default saves and clears it at every new task, which leaves one live conversation. |
 | `--no-mmproj-offload` | the 0.9 GB vision projector was the whole paged share at two slots. Images cost 7-12 s to the first token instead of 3-5 s. |
 | `-ub 1024` | prefill +6% at 17k and +11% at 41k over 256, for 0.3 GB more paged memory; 512 gives +4% and +8% for 0.1 GB. Decode does not change with it (55.7 against 56.0 t/s on identical text). |
-| MTP draft, `n-max 4` | +55% decode on prose, for 1.4 GB of VRAM and 3% of prefill speed. The draft head has its own KV cache; for prompt tokens only its K and V are computed, nothing else of the block is ever read. |
+| MTP draft, `n-max 4` | +45% decode on prose, +112% on code, for 1.4 GB of VRAM and 3% of prefill speed. The draft head has its own KV cache; for prompt tokens only its K and V are computed, nothing else of the block is ever read. |
 | `ROCMFPX_DRAFT_VOCAB=16384` | a drafted token is scored against 16,384 candidate tokens instead of all 248,320: half fixed, half the main model's own top tokens at the previous position, per slot. 0.12 ms instead of 1.9 ms per drafted token; the main model still verifies each one against the full vocabulary. Decode +9% on a short context, +3 to 5% at 41k. A verbatim copy drafts slightly less (acceptance 0.99 to 0.96), ordinary text the same. |
 | `--ctx-checkpoints 8` | kept in host RAM, ~200 MiB each. When the list is full, the one whose removal leaves the smallest gap is dropped; the one at the first user message never is. |
 | `--load-mode dio` | the default memory-mapped load keeps the 15 GB model file in system RAM. |
@@ -114,8 +114,22 @@ The server speaks the usual OpenAI-compatible API on `/v1`.
 ## Speed
 
 Measured on 9 October 2026 at the production shape (`-c 106496`, two slots,
-`-ub 1024`, vision projector on the CPU, draft vocabulary 16384), at
-temperature 0.
+`-ub 1024`, vision projector on the CPU, draft vocabulary 16384).
+
+Nine 450-token runs per row at temperature 1, on the production server while
+it was idle:
+
+| decode t/s | median | peak | lowest | draft accepted |
+|---|---:|---:|---:|---:|
+| prose | 50.1 | 53.2 | 47.4 | 0.58 |
+| code | 73.4 | 81.8 | 62.0 | 0.73 |
+| without MTP, prose or code | 34.6 | 34.7 | | |
+
+Code decodes faster than prose because more of the draft is accepted. That
+morning, before the three decode changes listed below, the same prompts gave
+47.3 for prose and 64.1 for code; the row without MTP is from that morning.
+
+At temperature 0 on fixed prompts, which is what the step tables below use:
 
 | decode t/s | |
 |---|---:|
@@ -123,11 +137,6 @@ temperature 0.
 | the 260-token answer to a cold 17k prompt | 53.4 |
 | at 41k depth (three 300-token turns) | 50.7 |
 | verbatim copy of a passage at 41k | 73.1 |
-| without MTP, short context | 34.6 |
-
-Code decodes faster than prose because more of the draft is accepted: nine
-450-token runs gave 64.1 t/s (peak 73.4) that morning, before the three decode
-changes listed below.
 
 | cold prompt | 17k | 41k |
 |---|---:|---:|

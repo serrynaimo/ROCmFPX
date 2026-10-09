@@ -92,8 +92,9 @@ q4_0 KV, MTP draft `n-max 4` over 16,384 candidate tokens
 
 | measure | value |
 | --- | ---: |
-| prose decode with MTP, short context / at 41k depth, tok/s | 53.8 / 50.7 |
-| prose decode without MTP, tok/s | 34.6 |
+| prose / code decode, MTP, tok/s, median (peak) | 50.1 (53.2) / 73.4 (81.8) |
+| decode at 41k depth, MTP, tok/s | 50.7 |
+| decode without MTP, tok/s | 34.6 |
 | prefill of a cold 17k / 41k prompt, tok/s | 679 / 621 |
 | the same without the MTP draft, tok/s | 701 / 640 |
 | VRAM at load, GB | 18.89 dedicated + 0.79 shared |
