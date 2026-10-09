@@ -4743,6 +4743,89 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// [TAG_OP_PROFILE] GGML_CUDA_OP_PROFILE=N: wait for the device after every node and add up the time per kind of node,
+// one table per kind of graph (number of nodes, decode-sized or prefill-sized batch), printed every N graphs.
+// A diagnostic: the waits slow a pass down and add a constant per node, so read the shares, not the totals.
+struct ggml_cuda_op_profile {
+    struct row   { double us = 0.0; int64_t n = 0; };
+    struct table { std::map<std::string, row> rows; int n_graphs = 0; int64_t n_kernels = 0; double us = 0.0; };
+
+    int every = 0;
+    std::map<std::string, table> tables;
+    table * cur = nullptr;
+};
+
+static ggml_cuda_op_profile & ggml_cuda_op_profile_get() {
+    static ggml_cuda_op_profile prof = [] {
+        ggml_cuda_op_profile res;
+        const char * env = getenv("GGML_CUDA_OP_PROFILE");
+        res.every = env ? atoi(env) : 0;
+        return res;
+    }();
+    return prof;
+}
+
+static std::string ggml_cuda_op_profile_key(const ggml_tensor * node) {
+    std::string key = ggml_op_desc(node);
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        key += std::string(" ") + ggml_type_name(node->src[0]->type) + " cols=" + std::to_string((long long) node->src[1]->ne[1]);
+    } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        key += std::string(" ") + ggml_type_name(node->src[1]->type) + " q=" + std::to_string((long long) node->src[0]->ne[1]);
+    } else if (node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_CPY) {
+        key += std::string(" ") + ggml_type_name(node->src[0]->type) + ">" + ggml_type_name(node->type);
+    }
+    return key;
+}
+
+static void ggml_cuda_op_profile_begin(const ggml_cgraph * cgraph) {
+    auto & prof = ggml_cuda_op_profile_get();
+    int64_t cols = 0;
+    for (int i = 0; i < cgraph->n_nodes && cols == 0; i++) {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+            cols = cgraph->nodes[i]->src[1]->ne[1];
+        }
+    }
+    const std::string key = std::string(cols <= 8 ? "decode" : "prefill") + " graph of " + std::to_string(cgraph->n_nodes) + " nodes";
+    prof.cur = &prof.tables[key];
+}
+
+static void ggml_cuda_op_profile_add(const std::string & key, double us) {
+    auto & prof = ggml_cuda_op_profile_get();
+    auto & row  = prof.cur->rows[key];
+    row.us += us;
+    row.n++;
+    prof.cur->us += us;
+    prof.cur->n_kernels++;
+}
+
+static void ggml_cuda_op_profile_end() {
+    auto & prof = ggml_cuda_op_profile_get();
+    auto & tab  = *prof.cur;
+    prof.cur = nullptr;
+    if (++tab.n_graphs < prof.every) {
+        return;
+    }
+    std::string name;
+    for (const auto & it : prof.tables) {
+        if (&it.second == &tab) {
+            name = it.first;
+        }
+    }
+    std::vector<std::pair<std::string, ggml_cuda_op_profile::row>> rows(tab.rows.begin(), tab.rows.end());
+    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second.us > b.second.us; });
+    const double n = (double) tab.n_graphs;
+    GGML_LOG_WARN("op profile [%s]: %d graphs, %.3f ms and %.0f kernels per graph\n", name.c_str(), tab.n_graphs, 1e-3 * tab.us / n, (double) tab.n_kernels / n);
+    int n_rows = 0;
+    for (const auto & it : rows) {
+        if (++n_rows > 28) {
+            break;
+        }
+        GGML_LOG_WARN("op profile row: %-46s %8.3f ms %5.1f%% calls %6.1f each %7.1f us\n", it.first.c_str(), 1e-3 * it.second.us / n,
+                100.0 * it.second.us / tab.us, (double) it.second.n / n, it.second.us / (double) it.second.n);
+    }
+    tab = ggml_cuda_op_profile::table();
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4883,9 +4966,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                const bool    op_prof    = ggml_cuda_op_profile_get().cur != nullptr;
+                const int64_t op_prof_t0 = op_prof ? ggml_time_us() : 0;
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    if (op_prof) {
+                        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                        ggml_cuda_op_profile_add("fused " + ggml_cuda_op_profile_key(node) + " .. " + ggml_op_desc(cgraph->nodes[i + nodes_to_skip]),
+                                (double) (ggml_time_us() - op_prof_t0));
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4917,6 +5008,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (op_prof) {
+                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    ggml_cuda_op_profile_add(ggml_cuda_op_profile_key(node), (double) (ggml_time_us() - op_prof_t0));
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -5027,6 +5123,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    // [TAG_OP_PROFILE] the profile waits for the device after every node, which a captured graph cannot do:
+    // evaluate every graph directly while it is on
+    if (ggml_cuda_op_profile_get().every > 0) {
+        use_cuda_graph             = false;
+        cuda_graph_update_required = false;
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -5037,7 +5140,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    const bool op_profile = ggml_cuda_op_profile_get().every > 0;
+    if (op_profile) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        ggml_cuda_op_profile_begin(cgraph);
+    }
+
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (op_profile) {
+        ggml_cuda_op_profile_end();
+    }
 
     g_gt_after_compute = true;
     return GGML_STATUS_SUCCESS;
