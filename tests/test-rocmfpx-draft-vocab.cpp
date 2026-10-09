@@ -72,6 +72,29 @@ static void test_projection(ggml_type type) {
     ggml_free(ctx);
 }
 
+// [TAG_DRAFT_VOCAB_SEQ] two sequences keep their own candidates
+static void test_sequences() {
+    constexpr int vocab = 12, count = 6;
+    auto state = std::make_shared<rocmfpx::draft_vocabulary>(vocab, count);
+    const std::vector<float> first {0,0,0,10,9,8,7,6,5,4,3,2};   // sequence 0: rows 0,1,2 + 3,4 + previous 11
+    const std::vector<float> second{0,0,0,2,3,4,5,6,7,8,9,10};   // sequence 1: rows 0,1,2 + 10,11 + previous 3
+    state->update(first.data(),  vocab, 11, 0);
+    state->update(second.data(), vocab, 3,  1);
+    std::vector<float> logits(vocab, 0.0f);
+    logits[4]  = 4.0f;
+    logits[10] = 5.0f;
+    llama_token winner = -1;
+    require(state->unique_max(logits.data(), winner, 0) && winner == 4,  "sequence 0 picks among its own candidates");
+    require(state->unique_max(logits.data(), winner, 1) && winner == 10, "sequence 1 picks among its own candidates");
+    require(state->unique_max(logits.data(), winner)    && winner == 4,  "the default sequence is 0");
+    state->update(second.data(), vocab, 3, 0);
+    require(state->unique_max(logits.data(), winner, 0) && winner == 10, "an update replaces the candidates of its sequence only");
+    require(state->unique_max(logits.data(), winner, 1) && winner == 10, "the other sequence is unchanged");
+    logits[10] = 0.0f;
+    logits[6]  = 9.0f; // row 6 is not among the first rows: never chosen
+    require(state->unique_max(logits.data(), winner, 3) && winner == 4, "a sequence that was never updated has the first rows");
+}
+
 int main() {
     auto state = std::make_shared<rocmfpx::draft_vocabulary>(12, 6);
     auto lease = state->claim_driver();
@@ -88,5 +111,6 @@ int main() {
     lease.reset();
     require(weak.expired(), "driver release does not leak vocabulary");
     for (auto type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) test_projection(type);
+    test_sequences();
     std::puts("PASS: F32/BF16/Q8_0 row projection, changing masks, exact winner, sampler fallback, state lifetime");
 }

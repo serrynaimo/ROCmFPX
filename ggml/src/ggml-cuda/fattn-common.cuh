@@ -1788,6 +1788,26 @@ void launch_fattn(
             }
         }
 
+        // [TAG_FATTN_PROBE] tuning probe: GGML_HIP_FA_PARALLEL_BLOCKS=N sets the number of blocks along the KV axis,
+        // GGML_CUDA_FA_DEBUG prints the launch shape of the first calls
+        {
+            static const int pb_override = [] { const char * env = getenv("GGML_HIP_FA_PARALLEL_BLOCKS"); return env ? atoi(env) : 0; }();
+            static const bool fa_debug   = getenv("GGML_CUDA_FA_DEBUG") != nullptr;
+            const int pb_auto = parallel_blocks;
+            if (pb_override > 0) {
+                parallel_blocks = std::max(1, std::min(pb_override, ntiles_KV));
+            }
+            if (fa_debug) {
+                static int n_printed = 0;
+                if (n_printed++ < 48) {
+                    GGML_LOG_WARN("fattn launch: K %s, q=%d, n_kv=%d, ncols1=%d ncols2=%d, nsm=%d max_blocks_per_sm=%d, ntiles_dst=%d ntiles_KV=%d, "
+                            "parallel_blocks=%d (auto %d), nwarps=%d nbatch_fa=%d, z=%d\n",
+                            ggml_type_name(K->type), (int) Q->ne[1], (int) n_kv, ncols1, ncols2, nsm, max_blocks_per_sm, ntiles_dst, ntiles_KV,
+                            parallel_blocks, pb_auto, nwarps, nbatch_fa, (int) (ntiles_z_gqa*K->ne[2]*Q->ne[3]));
+                }
+            }
+        }
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
