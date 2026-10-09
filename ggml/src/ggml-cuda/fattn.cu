@@ -804,7 +804,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     {
         static const int q4_tile_min = getenv("GGML_HIP_FA_Q4_TILE_MIN") ? atoi(getenv("GGML_HIP_FA_Q4_TILE_MIN")) : 1;
         static const int q4_tile_max = getenv("GGML_HIP_FA_Q4_TILE_MAX") ? atoi(getenv("GGML_HIP_FA_Q4_TILE_MAX")) : 8;
-        if (ggml_cuda_fattn_tile_reads_q4_0(dst) && gqa_opt_applies && q4_tile_min > 0 &&
+        if (ggml_cuda_fattn_tile_reads_q4_0(cc, dst) && gqa_opt_applies && q4_tile_min > 0 &&
                 Q->ne[1] >= q4_tile_min && Q->ne[1] <= q4_tile_max) {
             return BEST_FATTN_KERNEL_TILE;
         }
@@ -926,8 +926,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
             // [TAG_FATTN_TILE_Q4_0] no f16 copy of the cache when the tile kernel reads q4_0 itself
-            need_f16_K = !ggml_cuda_fattn_tile_reads_q4_0(dst);
-            need_f16_V = !ggml_cuda_fattn_tile_reads_q4_0(dst);
+            need_f16_K = !ggml_cuda_fattn_tile_reads_q4_0(ggml_cuda_info().devices[device].cc, dst);
+            need_f16_V = !ggml_cuda_fattn_tile_reads_q4_0(ggml_cuda_info().devices[device].cc, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;

@@ -506,8 +506,21 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 // an f16 copy of it. Converting the whole cache for every call costs as much as the attention itself once the batch is
 // a handful of decode tokens (measured on gfx1100 at 41k cells, 4 queries: 0.49 ms of 0.99 ms), and the vector kernel,
 // which also reads q4_0 directly, loads every K/V row once per query head instead of once per GQA group.
-static inline bool ggml_cuda_fattn_tile_reads_q4_0(const ggml_tensor * dst) {
+//
+// Measured on gfx1100 (RX 7900 XT) only, so it is on by default for that device family alone (RDNA3 desktop: RX 7900,
+// 7800, 7700, 7600). Every other card keeps the stock routing: the vector kernel for small batches and an f16 copy of
+// the cache for the tile kernel. GGML_HIP_FA_Q4_TILE=1 turns it on for any HIP card, =0 off for all of them.
+static inline bool ggml_cuda_fattn_tile_reads_q4_0(const int cc, const ggml_tensor * dst) {
 #if defined(GGML_USE_HIP) && defined(FAST_FP16_AVAILABLE)
+    static const int mode = [] {
+        const char * env = getenv("GGML_HIP_FA_Q4_TILE");
+        return env ? atoi(env) : -1;
+    }();
+
+    if (mode >= 0 ? mode == 0 : !GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+        return false;
+    }
+
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -515,6 +528,7 @@ static inline bool ggml_cuda_fattn_tile_reads_q4_0(const ggml_tensor * dst) {
     return K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 &&
            Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256;
 #else
+    GGML_UNUSED(cc);
     GGML_UNUSED(dst);
     return false;
 #endif // defined(GGML_USE_HIP) && defined(FAST_FP16_AVAILABLE)
@@ -1293,12 +1307,12 @@ template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
 static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
 
-    // [TAG_FATTN_TILE_Q4_0]
-    const bool kv_q4_0 = DKQ == 256 && DV == 256 && ggml_cuda_fattn_tile_reads_q4_0(dst);
-
     const int id        = ggml_cuda_get_device();
     const int cc        = ggml_cuda_info().devices[id].cc;
     const int warp_size = 32;
+
+    // [TAG_FATTN_TILE_Q4_0]
+    const bool kv_q4_0 = DKQ == 256 && DV == 256 && ggml_cuda_fattn_tile_reads_q4_0(cc, dst);
 
     constexpr size_t nbytes_shared = 0;
 
@@ -1421,7 +1435,7 @@ template <int DKQ, int DV, bool use_logit_softcap>
 static bool launch_fattn_tile_gqa6(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
 
-    const bool kv_q4_0 = ggml_cuda_fattn_tile_reads_q4_0(dst);
+    const bool kv_q4_0 = ggml_cuda_fattn_tile_reads_q4_0(ggml_cuda_info().devices[ggml_cuda_get_device()].cc, dst);
 
     switch (Q->ne[1]) {
         case 1: launch_fattn_tile_gqa6_case<DKQ, DV, 1, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
