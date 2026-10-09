@@ -11602,6 +11602,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
     // mixed quant and Q1_0 test cases
+    // ROCmFPX [TAG_FATTN_TILE_Q4_0]: decode-sized batches on a q4_0 cache with head size 256 and grouped queries;
+    // on HIP the tile kernel expands the q4_0 K/V tiles itself. Other backends take their usual path.
+    for (int64_t nr2 : {2, 4, 6, 8}) {
+        for (int64_t kv : {256, 1024, 2304}) {
+            for (int64_t nb : {1, 2, 3, 5, 8}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+            }
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
@@ -11899,6 +11908,66 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // ROCmFPX: the prefill GEMM shapes of Qwen3.8-27B (embedding 5120, ffn 17408, attention/GDN projections 6144)
+    // at the production ubatch of 256 and at 512, for the fork's FP4/FP6 weight types against vanilla Q4_0.
+    for (ggml_type t : {GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q6_0_ROCMFPX, GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_Q4_0, GGML_TYPE_F16}) {
+        for (int64_t n : {256, 512}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n,  5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  5120, n, 17408, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  6144, n,  5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  5120, n,  6144, {1, 1}, {1, 1}));
+        }
+    }
+
+    // ROCmFPX: decode-sized attention at depth: 1 and 4 queries (a draft step, a verify batch) over 16k and 41k cells,
+    // head 256, 4 KV heads with GQA 6, the production q4_0 KV cache against f16
+    for (int64_t kv : {16384, 40960}) {
+        for (int64_t nb : {1, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
+        }
+    }
+
+    // ROCmFPX: tile-width probe. One column tile of J = n: does a narrower tile (smaller LDS footprint) do more work per second?
+    for (int64_t n : {32, 64, 96, 128}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_F32, 17408, n,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_F32,  5120, n, 17408, {1, 1}, {1, 1}));
+    }
+
+    // ROCmFPX: Qwen3.8-27B prefill shapes of the two non-GEMM ops. GDN: 16 key heads x 3 = 48 value heads of 128, one
+    // ubatch of 256/512 tokens. Attention: head 256, 4 KV heads with GQA 6, q4_0 KV cache at 16k/32k depth, 256 queries.
+    for (int64_t n_tokens : {256, 512}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 3));
+    }
+    for (int64_t kv : {16384, 32768}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 256, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 256, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
+    }
+
+    // ROCmFPX: decode-sized weight reads (a single token, a verify batch of 2..5): how close to the memory bandwidth of the
+    // card do the matrix-vector kernels of the fork types run, against vanilla Q4_0 and F16 (4x the bytes per weight)?
+    for (ggml_type t : {GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q6_0_ROCMFPX, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        for (int64_t n : {1, 2, 4, 5}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n,  5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  5120, n, 17408, {1, 1}, {1, 1}));
+        }
+    }
+
+    // The same with four times the rows (200 MB at 4.5 bits): larger than the 80 MB cache of the RX 7900 XT, as every weight
+    // matrix is during a real pass over 15 GB of weights. Per weight the work is the same as for m=17408.
+    for (ggml_type t : {GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q6_0_ROCMFPX, GGML_TYPE_Q4_0}) {
+        for (int64_t n : {1, 2, 3, 4, 5, 8}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 69632, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+
+    // ROCmFPX: the output layer of Qwen3.8-27B for one drafted token. The full LM head (248320 rows of 5120, Q6) against
+    // the draft vocabulary projection, which multiplies only the selected rows (indirect matmul, one 1-row matrix per row).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_0_ROCMFPX, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1}));
+    for (int n_used : {8192, 16384, 32768}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_0_ROCMFPX, GGML_TYPE_F32, 248320, n_used, true, 1, 1, 5120));
+    }
 
     // GLM-5.3-Flash routed-expert prefill: 288 experts, top-8, 2048 tokens, K=4096 (M=1024 keeps the weights small)
     for (ggml_type t : {GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S}) {
