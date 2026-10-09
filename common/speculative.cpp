@@ -1401,7 +1401,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<llama_sampler *> backend_chains;
 
     int32_t n_embd = 0;
-    int draft_score_row = -1;
+    // [TAG_DRAFT_VOCAB_SEQ] per sequence: the row of the last target batch whose logits rank the draft candidates
+    // (-1 = none: the sequence was not in that batch, its candidates stay as they are)
+    std::vector<int> draft_score_row;
     std::shared_ptr<rocmfpx::draft_vocabulary> candidate_vocabulary;
     std::shared_ptr<void> candidate_driver;
 
@@ -1438,8 +1440,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
         candidate_vocabulary = rocmfpx::draft_vocabulary_for(llama_get_model(ctx_dft));
+        draft_score_row.assign(n_seq, -1);
         if (candidate_vocabulary) {
-            GGML_ASSERT(n_seq == 1 && "native draft vocabulary currently supports one slot");
             candidate_driver = candidate_vocabulary->claim_driver();
             SPC_INF("ROCmFPX native draft vocabulary: %d rows; target verification uses the full vocabulary\n", candidate_vocabulary->size());
         }
@@ -1528,7 +1530,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
-        draft_score_row = -1;
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            draft_score_row[seq_id] = -1;
+        }
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
         const int32_t N = (int32_t) prompt.size();
@@ -1549,6 +1553,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const common_batch & batch_in) override {
+        // a new target batch: the rows of the previous one are gone ([TAG_DRAFT_VOCAB_SEQ])
+        std::fill(draft_score_row.begin(), draft_score_row.end(), -1);
+
         if (batch_in.size() <= 0) {
             return true;
         }
@@ -1643,18 +1650,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
+            // [TAG_MTP_KV_ONLY] accept() reads row min(n_accepted, n_rows - 1): keep the rows a verification can
+            // address instead of every row of a prompt batch
+            const int32_t n_keep = std::min<int32_t>(n_rows, std::max<int32_t>(16, this->params.n_max + 1));
+            verify_h[seq_id].resize((size_t) n_keep * n_embd);
+
+            for (int32_t i = 0; i < n_keep; ++i) {
                 const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
             std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+                    llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + n_rows - 1), row_bytes);
         }
 
-        draft_score_row = -1;
+        // until accept() names the row of the sampled token: the last row of the sequence, if the target computed it
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            const int32_t i_end = i_batch_end[seq_id];
+            draft_score_row[seq_id] = i_end >= 0 && batch_in.tokens[i_end].output ? i_end : -1;
+        }
         return true;
     }
 
@@ -1674,10 +1689,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            if (candidate_vocabulary) {
+            if (candidate_vocabulary && draft_score_row[seq_id] >= 0) {
                 const auto * target_model = llama_get_model(params.ctx_tgt);
-                candidate_vocabulary->update(llama_get_logits_ith(params.ctx_tgt, draft_score_row),
-                    llama_vocab_n_tokens(llama_model_get_vocab(target_model)), dp.id_last);
+                const float * scores = llama_get_logits_ith(params.ctx_tgt, draft_score_row[seq_id]);
+                if (scores) {
+                    candidate_vocabulary->update(scores, llama_vocab_n_tokens(llama_model_get_vocab(target_model)), dp.id_last, seq_id);
+                }
             }
             n_drafting++;
             drafting[seq_id] = true;
@@ -1754,7 +1771,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_token id = LLAMA_TOKEN_NULL;
                 float p_top = 0.0f;
                 const bool used_exact = direct_choice && candidate_vocabulary->unique_max(
-                    llama_get_logits_ith(ctx_dft, i_last[seq_id]), id);
+                    llama_get_logits_ith(ctx_dft, i_last[seq_id]), id, seq_id);
                 llama_token id_sampled = LLAMA_TOKEN_NULL;
                 std::vector<llama_token_data> q_row; // the drafted token's distribution, when the caller verifies by rejection
                 if (!used_exact) {
@@ -1873,8 +1890,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
-        draft_score_row = i_batch_beg[seq_id] + i_h;
+        draft_score_row[seq_id] = i_batch_beg[seq_id] + i_h;
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if ((size_t) (i_h + 1) * n_embd > verify_h[seq_id].size()) {
+            // not a row that process() kept (see [TAG_MTP_KV_ONLY] there): pending_h already holds the last row
+            return;
+        }
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
 
@@ -1883,7 +1904,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        draft_score_row = -1;
+        draft_score_row[seq_id] = -1;
         std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
         verify_h[seq_id].clear();
         verify_h_rows[seq_id] = 0;

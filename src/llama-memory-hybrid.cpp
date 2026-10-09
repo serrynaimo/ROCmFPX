@@ -62,7 +62,10 @@ llama_memory_hybrid::llama_memory_hybrid(
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
-    )) {}
+    )) {
+    // [TAG_KV_LANES] the graph inputs of this memory check the range offset before a graph is reused
+    mem_attn->set_lanes(true);
+}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
@@ -86,7 +89,8 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                // [TAG_KV_LANES] one sequence per ubatch, so that each ubatch attends only to its own lane
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, mem_attn->get_lanes() ? 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {

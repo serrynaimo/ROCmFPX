@@ -22,9 +22,10 @@ public:
     // Reject concurrent draft drivers using the same model. Releasing this
     // lease permits another driver, including during exception unwinding.
     std::shared_ptr<void> claim_driver();
-    void update(const float * scores, int vocabulary, llama_token previous);
-    bool unique_max(const float * full_logits, llama_token & token) const;
-    void upload(ggml_tensor * projection_ids, ggml_tensor * scatter_ids) const;
+    // [TAG_DRAFT_VOCAB_SEQ] one candidate set per sequence: two slots draft from their own context
+    void update(const float * scores, int vocabulary, llama_token previous, llama_seq_id seq = 0);
+    bool unique_max(const float * full_logits, llama_token & token, llama_seq_id seq = 0) const;
+    void upload(ggml_tensor * projection_ids, ggml_tensor * scatter_ids, llama_seq_id seq = 0) const;
 private:
     struct storage;
     std::unique_ptr<storage> data_;

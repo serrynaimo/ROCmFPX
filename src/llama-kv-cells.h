@@ -51,6 +51,7 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+            seq_idx[s].clear();
         }
     }
 
@@ -96,6 +97,20 @@ public:
     // return 0 if no cells are used
     uint32_t used_max_p1() const {
         return used.empty() ? 0 : *used.rbegin() + 1;
+    }
+
+    // [TAG_KV_LANES] the lowest cell index that carries sequence seq_id
+    // return size() if the sequence has no cells
+    uint32_t seq_idx_min(llama_seq_id seq_id) const {
+        const auto & si = seq_idx[seq_id];
+        return si.empty() ? size() : *si.begin();
+    }
+
+    // [TAG_KV_LANES] the highest cell index that carries sequence seq_id + 1
+    // return 0 if the sequence has no cells
+    uint32_t seq_idx_max_p1(llama_seq_id seq_id) const {
+        const auto & si = seq_idx[seq_id];
+        return si.empty() ? 0 : *si.rbegin() + 1;
     }
 
     bool get_has_shift() const {
@@ -531,16 +546,24 @@ private:
     //
     std::set<std::pair<llama_pos, uint32_t>> seq_pos[LLAMA_MAX_SEQ];
 
+    // [TAG_KV_LANES] the set seq_idx[s] holds the indices of the cells that carry sequence s,
+    // so the range of cells a sequence can attend to is known without scanning the cache
+    std::set<uint32_t> seq_idx[LLAMA_MAX_SEQ];
+
     // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, uint32_t i) {
         const auto n = seq_pos[s].erase({ pos[i], i });
         assert(n == 1);
         GGML_UNUSED(n);
+
+        seq_idx[s].erase(i);
     }
 
     void seq_pos_inc(llama_seq_id s, uint32_t i) {
         seq_pos[s].insert({ pos[i], i });
+
+        seq_idx[s].insert(i);
     }
 
     // remove cell i

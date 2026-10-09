@@ -352,6 +352,9 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // [TAG_KV_LANES] the first cell of the K/V views that this graph was built with
+    uint32_t kv_off = 0;
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -390,6 +393,9 @@ public:
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // [TAG_KV_LANES] the first cell of the K view that this graph was built with
+    uint32_t kv_off = 0;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -1236,6 +1242,14 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
+
+    // [TAG_MTP_KV_ONLY] the cache-store half of build_attn(): writes k_cur and v_cur to the KV cache and
+    // computes nothing else. For batches that only bring a cache up to date and have no output rows.
+    void build_attn_kv_store(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            int il) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,

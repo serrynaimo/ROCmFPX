@@ -17,11 +17,24 @@ struct draft_vocabulary::storage {
     mutable std::mutex mutex;
     bool driver_claimed = false;
     draft_selector selector;
-    std::vector<int32_t> projection;
-    std::vector<int64_t> scatter;
-    storage(int n, int k) : vocabulary(n), budget(k), projection(k), scatter(k) {
-        std::iota(projection.begin(), projection.end(), 0);
-        std::iota(scatter.begin(), scatter.end(), 0);
+    // [TAG_DRAFT_VOCAB_SEQ] the candidates of one sequence; a sequence that was never updated has the first rows
+    struct candidates {
+        std::vector<int32_t> projection;
+        std::vector<int64_t> scatter;
+    };
+    mutable std::vector<candidates> seqs;
+    storage(int n, int k) : vocabulary(n), budget(k) {}
+    candidates & of(llama_seq_id seq) const {
+        const size_t i = seq < 0 ? 0 : (size_t) seq;
+        while (seqs.size() <= i) {
+            candidates c;
+            c.projection.resize(budget);
+            c.scatter.resize(budget);
+            std::iota(c.projection.begin(), c.projection.end(), 0);
+            std::iota(c.scatter.begin(), c.scatter.end(), 0);
+            seqs.push_back(std::move(c));
+        }
+        return seqs[i];
     }
 };
 
@@ -53,20 +66,22 @@ std::shared_ptr<void> draft_vocabulary::claim_driver() {
     lease->active = true;
     return lease;
 }
-void draft_vocabulary::update(const float * scores, int n, llama_token previous) {
+void draft_vocabulary::update(const float * scores, int n, llama_token previous, llama_seq_id seq) {
     if (!scores || n != data_->vocabulary) throw std::invalid_argument("draft vocabulary score shape mismatch");
     std::lock_guard<std::mutex> lock(data_->mutex);
-    data_->projection = data_->selector.select(scores, n, data_->budget, previous);
-    data_->scatter.assign(data_->projection.begin(), data_->projection.end());
+    auto & cand = data_->of(seq);
+    cand.projection = data_->selector.select(scores, n, data_->budget, previous);
+    cand.scatter.assign(cand.projection.begin(), cand.projection.end());
 }
-bool draft_vocabulary::unique_max(const float * scores, llama_token & token) const {
+bool draft_vocabulary::unique_max(const float * scores, llama_token & token, llama_seq_id seq) const {
     if (!scores) return false;
     std::lock_guard<std::mutex> lock(data_->mutex);
-    int best = data_->projection.front();
+    const auto & projection = data_->of(seq).projection;
+    int best = projection.front();
     bool single = true;
     if (std::isnan(scores[best])) return false;
-    for (size_t i = 1; i < data_->projection.size(); ++i) {
-        const int id = data_->projection[i];
+    for (size_t i = 1; i < projection.size(); ++i) {
+        const int id = projection[i];
         if (std::isnan(scores[id])) return false;
         if (scores[id] > scores[best]) { best = id; single = true; }
         else if (scores[id] == scores[best]) single = false;
@@ -75,13 +90,15 @@ bool draft_vocabulary::unique_max(const float * scores, llama_token & token) con
     token = best;
     return true;
 }
-void draft_vocabulary::upload(ggml_tensor * projection, ggml_tensor * scatter) const {
+void draft_vocabulary::upload(ggml_tensor * projection, ggml_tensor * scatter, llama_seq_id seq) const {
     std::lock_guard<std::mutex> lock(data_->mutex);
-    ggml_backend_tensor_set(projection, data_->projection.data(), 0, data_->projection.size() * sizeof(int32_t));
-    ggml_backend_tensor_set(scatter, data_->scatter.data(), 0, data_->scatter.size() * sizeof(int64_t));
+    const auto & cand = data_->of(seq);
+    ggml_backend_tensor_set(projection, cand.projection.data(), 0, cand.projection.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(scatter, cand.scatter.data(), 0, cand.scatter.size() * sizeof(int64_t));
 }
 std::shared_ptr<draft_vocabulary> draft_vocabulary_for(const llama_model * model) {
-    if (!model || model->arch != LLM_ARCH_QWEN4EXP) return {};
+    // [TAG_DRAFT_VOCAB_SEQ] the Qwen3.x MTP head projects through the same full LM head
+    if (!model || (model->arch != LLM_ARCH_QWEN4EXP && model->arch != LLM_ARCH_QWEN35 && model->arch != LLM_ARCH_QWEN35MOE)) return {};
     const char * setting = std::getenv("ROCMFPX_DRAFT_VOCAB");
     if (!setting || !*setting) return {};
     char * end = nullptr;
@@ -120,7 +137,11 @@ public:
         ggml_set_input(rows);
         ggml_set_input(destinations);
     }
-    void set_input(const llama_ubatch *) override { owner_->upload(rows, destinations); }
+    // the graph has one row, so one sequence: its candidates ([TAG_DRAFT_VOCAB_SEQ])
+    void set_input(const llama_ubatch * ubatch) override {
+        const llama_seq_id seq = ubatch && ubatch->n_tokens > 0 && ubatch->seq_id && ubatch->seq_id[0] ? ubatch->seq_id[0][0] : 0;
+        owner_->upload(rows, destinations, seq);
+    }
     bool can_reuse(const llm_graph_params & params) override { return params.ubatch.n_tokens == 1; }
     ggml_tensor * rows;
     ggml_tensor * destinations;

@@ -8,6 +8,8 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-memory-hybrid-idx.h"
+#include "llama-memory-hybrid.h"
+#include "llama-kv-cache.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -283,6 +285,14 @@ llama_context::llama_context(
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
+
+        // [TAG_DECODE_PROFILE]
+        const char * LLAMA_DECODE_PROFILE = getenv("LLAMA_DECODE_PROFILE");
+        prof_every = LLAMA_DECODE_PROFILE ? atoll(LLAMA_DECODE_PROFILE) : 0;
+        prof_on    = prof_every > 0;
+        if (prof_every == 1) {
+            prof_every = 256;
+        }
 
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
@@ -781,7 +791,15 @@ void llama_context::synchronize() {
         return;
     }
 
+    // [TAG_DECODE_PROFILE]
+    const int64_t t_prof_sync = prof_on ? ggml_time_us() : 0;
+
     ggml_backend_sched_synchronize(sched.get());
+
+    if (prof_on) {
+        prof_t_sync += ggml_time_us() - t_prof_sync;
+        prof_n_sync++;
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1410,13 +1428,25 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // [TAG_DECODE_PROFILE]
+    int64_t t_prof = prof_on ? ggml_time_us() : 0;
+    const auto prof_lap = [&](int64_t & acc) {
+        if (prof_on) {
+            const int64_t t_now = ggml_time_us();
+            acc += t_now - t_prof;
+            t_prof = t_now;
+        }
+    };
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 
-    auto * res = get_gf_res_prev();
+    prof_lap(prof_t_memory);
+
+    auto * res = get_gf_res_prev(ubatch.n_tokens);
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -1430,6 +1460,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        prof_n_built++;
+
         gf_res_prev_active = nullptr;
         res->reset();
 
@@ -1457,6 +1489,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    prof_lap(prof_t_graph);
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1467,11 +1501,34 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    prof_lap(prof_t_inputs);
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    prof_lap(prof_t_submit);
+
+    // [TAG_DECODE_PROFILE]
+    if (prof_on) {
+        prof_n++;
+        prof_n_tokens += ubatch.n_tokens;
+
+        if (prof_n >= prof_every) {
+            const double n = (double) prof_n;
+            LLAMA_LOG_WARN("decode profile [%s]: %lld ubatches, %.1f tokens each, %lld graphs built; ms per ubatch: memory %.3f, graph %.3f, inputs %.3f, submit %.3f; "
+                    "%lld waits for the backend, %.3f ms each (%.1f ms per ubatch)\n",
+                    cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "draft" : "main",
+                    (long long) prof_n, (double) prof_n_tokens / n, (long long) prof_n_built,
+                    1e-3 * prof_t_memory / n, 1e-3 * prof_t_graph / n, 1e-3 * prof_t_inputs / n, 1e-3 * prof_t_submit / n,
+                    (long long) prof_n_sync, prof_n_sync > 0 ? 1e-3 * prof_t_sync / (double) prof_n_sync : 0.0, 1e-3 * prof_t_sync / n);
+
+            prof_n = prof_n_tokens = prof_n_built = prof_n_sync = 0;
+            prof_t_memory = prof_t_graph = prof_t_inputs = prof_t_submit = prof_t_sync = 0;
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2471,8 +2528,11 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
-llm_graph_result * llama_context::get_gf_res_prev() {
-    auto & res = gf_res_prev[n_outputs > 0];
+llm_graph_result * llama_context::get_gf_res_prev(uint32_t n_tokens) {
+    // [TAG_GRAPH_ARENAS]
+    const uint32_t i_size = n_tokens >= 1 && n_tokens <= GF_RES_SMALL_MAX ? n_tokens : 0;
+
+    auto & res = gf_res_prev[2*i_size + (n_outputs > 0 ? 1 : 0)];
     if (!res) {
         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
     }
@@ -4139,6 +4199,21 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+// [TAG_KV_LANES]
+bool llama_kv_lanes_enabled(const llama_context * ctx) {
+    llama_memory_t mem = llama_get_memory(ctx);
+
+    if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_attn()->get_lanes();
+    }
+
+    if (const auto * kv = dynamic_cast<const llama_kv_cache *>(mem)) {
+        return kv->get_lanes();
+    }
+
+    return false;
 }
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {

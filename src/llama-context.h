@@ -263,7 +263,7 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
-    llm_graph_result * get_gf_res_prev();
+    llm_graph_result * get_gf_res_prev(uint32_t n_tokens = 0);
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -397,7 +397,13 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // [TAG_GRAPH_ARENAS] So do the small batch sizes: with speculative decoding the verification batch is 1..n_max+1
+    // tokens and changes size from one decode to the next. In a single arena every size change rewrites the graph
+    // in place, the backend sees its properties change and never gets to replay a captured graph. One arena per
+    // size keeps node addresses and properties stable per size, so each size is captured once and replayed.
+    // Index: 2*(n_tokens if 1 <= n_tokens <= GF_RES_SMALL_MAX else 0) + (n_outputs > 0)
+    static constexpr uint32_t GF_RES_SMALL_MAX = 8;
+    std::array<llm_graph_result_ptr, 2*(1 + GF_RES_SMALL_MAX)> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
@@ -426,4 +432,18 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // [TAG_DECODE_PROFILE] env LLAMA_DECODE_PROFILE=1: host time per ubatch by phase and the time spent waiting
+    // for the backend, logged every prof_every ubatches
+    bool    prof_on       = false;
+    int64_t prof_every    = 0;
+    int64_t prof_n        = 0; // ubatches
+    int64_t prof_n_tokens = 0;
+    int64_t prof_n_built  = 0; // graphs built instead of reused
+    int64_t prof_t_memory = 0; // mctx->apply(): cells, mask ranges
+    int64_t prof_t_graph  = 0; // reuse check, or build + alloc
+    int64_t prof_t_inputs = 0; // set_inputs: masks, positions, embeddings upload
+    int64_t prof_t_submit = 0; // graph_compute(): kernels queued
+    int64_t prof_t_sync   = 0; // synchronize(): waiting for the backend to finish
+    int64_t prof_n_sync   = 0;
 };

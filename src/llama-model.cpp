@@ -3035,7 +3035,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
-                        res = new llama_kv_cache(
+                        auto * kv = new llama_kv_cache(
                                 *this,
                                 hparams,
                                 params.type_k,
@@ -3052,6 +3052,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 filter,
                                 nullptr,
                                 nullptr);
+
+                        // [TAG_KV_LANES] the MTP draft context of the hybrid Qwen models builds its graph with
+                        // build_attn_inp_kv(), which checks the range offset before a graph is reused
+                        if (mtp_on_hybrid_qwen) {
+                            kv->set_lanes(true);
+                        }
+
+                        res = kv;
                     }
                 }
             }

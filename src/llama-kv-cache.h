@@ -192,9 +192,23 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // [TAG_KV_LANES] the range of cells [off, off + n) that the tokens of the ubatch can attend to
+    // without lanes this is [0, get_n_kv())
+    struct kv_range {
+        uint32_t off;
+        uint32_t n;
+    };
+
+    kv_range get_kv_range(const slot_info & sinfo, const llama_ubatch & ubatch) const;
+
+    // [TAG_KV_LANES] opt-in, see the comment at kv_lane_head() in llama-kv-cache.cpp
+    // only the owners whose graph inputs check the range offset before reusing a graph may enable this
+    void set_lanes(bool enable);
+    bool get_lanes() const { return lanes; }
+
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t kv_off = 0) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t kv_off = 0) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -233,7 +247,7 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_off = 0) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -291,6 +305,9 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
+
+    // [TAG_KV_LANES] one range of cells per sequence, see kv_lane_head()
+    bool lanes = false;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
@@ -400,6 +417,9 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // [TAG_KV_LANES] index of the first cell of the K/V views, the mask is relative to it
+    uint32_t get_kv_off() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -470,4 +490,7 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // [TAG_KV_LANES] first cell of the attended range, 0 without lanes
+    uint32_t kv_off = 0;
 };

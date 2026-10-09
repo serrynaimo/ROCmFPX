@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "../rocmfpx-draft-vocab.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -532,8 +533,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     res->add_input(std::move(inp));
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos = build_inp_pos();
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -591,6 +591,15 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
 
+    // [TAG_MTP_KV_ONLY] A ubatch without output rows only brings the cache of the MTP block up to date: this is the
+    // catch-up over the prompt, one pass per prompt batch. Nothing reads the output of the block for these positions,
+    // a later draft step attends to their K and V only. So store K and V and leave out Q, the attention over the
+    // history, the output projection and the FFN: about 85% of the weights of the block and all of its attention.
+    if (n_outputs == 0) {
+        build_attn_kv_store(inp_attn, Kcur, Vcur, il);
+        return;
+    }
+
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
@@ -630,13 +639,28 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
+    // [TAG_MTP_KV_ONLY] created here and not at the top: an input that the graph does not use is never allocated
+    // and set_inputs() would then write to a tensor without a buffer
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
     cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+
+    // [TAG_DRAFT_VOCAB_SEQ] a draft step has one row: with ROCMFPX_DRAFT_VOCAB=N it multiplies only the N candidate rows of
+    // the LM head instead of all of them (1.03 GB at Q6 for this model). Rows that are not candidates get -inf. The target
+    // still verifies every drafted token against the full vocabulary.
+    auto draft_vocabulary = rocmfpx::draft_vocabulary_for(&model);
+    if (draft_vocabulary && ggml_nrows(cur) == 1 && !head_s && (loras == nullptr || loras->empty())) {
+        auto projection = rocmfpx::build_draft_projection(ctx0, std::move(draft_vocabulary), head_w, cur);
+        cur = projection.logits;
+        res->add_input(std::move(projection.input));
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

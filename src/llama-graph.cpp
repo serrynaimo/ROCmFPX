@@ -505,6 +505,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
 
+    // [TAG_KV_LANES] the offset of the K/V views is part of the graph
+    res &= kv_off == mctx->get_kv_off();
+
     return res;
 }
 
@@ -528,6 +531,9 @@ bool llm_graph_input_attn_k::can_reuse_impl(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    // [TAG_KV_LANES] the offset of the K view is part of the graph
+    res &= kv_off == mctx->get_kv_off();
 
     return res;
 }
@@ -1140,6 +1146,9 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
+    // [TAG_KV_LANES] the offset of the K/V views is part of the graph
+    res &= inp_attn->kv_off == mctx->get_attn()->get_kv_off();
+
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
@@ -1184,6 +1193,9 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    // [TAG_KV_LANES] the offset of the K/V views is part of the graph
+    res &= inp_attn->kv_off == mctx->get_attn()->get_kv_off();
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2917,7 +2929,35 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
+    // [TAG_KV_LANES] the K/V views of this graph start at this cell
+    inp->kv_off = mctx_cur->get_kv_off();
+
     return inp;
+}
+
+// [TAG_MTP_KV_ONLY] must store exactly what build_attn(llm_graph_input_attn_kv *, ...) stores
+void llm_graph_context::build_attn_kv_store(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        int il) const {
+    GGML_ASSERT(!cparams.training);
+
+    if (inp->self_k_rot) {
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    }
+
+    if (inp->self_v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    }
+
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
 }
 
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
@@ -3029,6 +3069,9 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
+
+    // [TAG_KV_LANES] the K view of this graph starts at this cell
+    inp->kv_off = mctx_cur->get_kv_off();
 
     return inp;
 }

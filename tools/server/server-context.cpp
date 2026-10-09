@@ -17,6 +17,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "../../src/llama-ext.h" // staging API: llama_kv_lanes_enabled
+
 #include <algorithm>
 #include <limits>
 #include <cstddef>
@@ -1343,6 +1345,12 @@ private:
             SRV_INF("shared KV pool of %d tokens: a request starts beside running ones only if all of them fit, "
                     "with %d tokens of generation room each; otherwise it waits\n",
                     kv_pool_size(), params_base.kv_unified_reserve);
+        }
+
+        // [TAG_KV_LANES]
+        if (llama_kv_lanes_enabled(ctx_tgt)) {
+            SRV_INF("shared KV pool: each of the %d slots has its own range of cells, attention covers only the cells of the active slot\n",
+                    params_base.n_parallel);
         }
 
         // initialize slots
@@ -3374,7 +3382,8 @@ private:
         }
     }
 
-    // @ngxson : for debugging only
+    // [TAG_DECODE_PROFILE] env LLAMA_DECODE_PROFILE=1: the phases of the server loop, logged every 5 seconds of work
+    // (was the compile-time DEBUG_TIMINGS)
     int64_t t_pre_decode  = 0;
     int64_t t_decode      = 0;
     int64_t t_post_decode = 0;
@@ -3383,40 +3392,46 @@ private:
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
-// #define DEBUG_TIMINGS
-#ifdef DEBUG_TIMINGS
+    int64_t t_draft       = 0; // inside pre_decode
+    int64_t n_draft       = 0;
+    int64_t t_tgt         = 0; // inside decode: target pass incl. the wait for the backend
+    int64_t n_tgt         = 0;
+    int64_t t_catchup     = 0; // inside decode: speculative catch-up pass
+    int64_t n_catchup     = 0;
+    int64_t n_prof_tokens = 0; // tokens in the target batches
+    const bool prof_on = getenv("LLAMA_DECODE_PROFILE") != nullptr && atoi(getenv("LLAMA_DECODE_PROFILE")) > 0;
+
     struct scoped_timer {
-        int64_t & t;
-        int64_t & n;
-        int64_t t_start;
-        scoped_timer(int64_t & t_, int64_t & n_) : t(t_), n(n_) {
-            t_start = ggml_time_us();
+        int64_t * t = nullptr;
+        int64_t * n = nullptr;
+        int64_t t_start = 0;
+        scoped_timer(int64_t & t_, int64_t & n_, bool on) {
+            if (on) {
+                t = &t_;
+                n = &n_;
+                t_start = ggml_time_us();
+            }
         }
         ~scoped_timer() {
-            t += ggml_time_us() - t_start;
-            n++;
+            if (t) {
+                *t += ggml_time_us() - t_start;
+                (*n)++;
+            }
         }
     };
-#else
-    struct scoped_timer {
-        scoped_timer(int64_t &, int64_t &) {}
-        ~scoped_timer() {}
-    };
-#endif
 
     void update_slots() {
-#ifdef DEBUG_TIMINGS
-        static int64_t t_prev = 0;
-        int64_t t_start = ggml_time_us();
-        if (t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
-            t_prev = t_start;
-            SRV_INF("n_pre_decode      = %" PRId64 "\n", n_pre_decode);
-            SRV_INF("avg t_pre_decode  = %f ms\n", (double) t_pre_decode / n_pre_decode / 1000.0);
-            SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
-            SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / n_post_decode / 1000.0);
-            SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
+        // [TAG_DECODE_PROFILE]
+        if (prof_on && t_pre_decode + t_decode + t_post_decode > 5 * 1000 * 1000 && n_decode > 0) {
+            const double n = (double) n_decode;
+            SRV_WRN("loop profile: %lld loops, %.1f tokens per target batch; ms per loop: pre %.3f (draft %.3f), decode %.3f (target pass + wait %.3f, "
+                    "catch-up %.3f), post %.3f (sampling %.3f); total %.3f\n",
+                    (long long) n_decode, (double) n_prof_tokens / n,
+                    1e-3 * t_pre_decode / n, 1e-3 * t_draft / n, 1e-3 * t_decode / n, 1e-3 * t_tgt / n, 1e-3 * t_catchup / n,
+                    1e-3 * t_post_decode / n, 1e-3 * t_sampl / n, 1e-3 * (t_pre_decode + t_decode + t_post_decode) / n);
+            t_pre_decode = t_decode = t_post_decode = t_sampl = t_draft = t_tgt = t_catchup = 0;
+            n_pre_decode = n_decode = n_post_decode = n_sampl = n_draft = n_tgt = n_catchup = n_prof_tokens = 0;
         }
-#endif
 
         // check if all slots are idle
         {
@@ -3449,7 +3464,7 @@ private:
         kv_pool_keep_headroom();
 
         try {
-            scoped_timer t(t_pre_decode, n_pre_decode);
+            scoped_timer t(t_pre_decode, n_pre_decode, prof_on);
             pre_decode();
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
@@ -3485,14 +3500,13 @@ private:
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
-                scoped_timer t(t_decode, n_decode);
+                scoped_timer t(t_decode, n_decode, prof_on);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
+
+                n_prof_tokens += n_tokens;
 
                 batch.render(off, n_tokens);
                 bool ok = decode(n_batch, off);
-#ifdef DEBUG_TIMINGS
-                llama_synchronize(ctx_tgt);
-#endif
 
                 if (ok) {
                     // move the head of the batch forward with the number of tokens we just processed
@@ -3511,7 +3525,7 @@ private:
             }
 
             try {
-                scoped_timer t(t_post_decode, n_post_decode);
+                scoped_timer t(t_post_decode, n_post_decode, prof_on);
                 post_decode(n_tokens, off);
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
@@ -3677,6 +3691,7 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            scoped_timer t(t_draft, n_draft, prof_on);
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
@@ -4391,12 +4406,15 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        queue_tasks.yield_to_queue([&]() {
-            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
-            if (ret == 0 && has_output) {
-                llama_synchronize(ctx_tgt);
-            }
-        });
+        {
+            scoped_timer t(t_tgt, n_tgt, prof_on);
+            queue_tasks.yield_to_queue([&]() {
+                ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+                if (ret == 0 && (has_output || prof_on)) {
+                    llama_synchronize(ctx_tgt);
+                }
+            });
+        }
 
         if (ret != 0) {
             {
@@ -4456,9 +4474,16 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch.view);
-            });
+            {
+                scoped_timer t(t_catchup, n_catchup, prof_on);
+                queue_tasks.yield_to_queue([&]() {
+                    ok = common_speculative_process(spec.get(), batch.view);
+                    if (prof_on && ctx_dft) {
+                        // attribute the wait for the catch-up pass to this phase
+                        llama_synchronize(ctx_dft);
+                    }
+                });
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -4565,7 +4590,7 @@ private:
 
             llama_token id;
             {
-                scoped_timer timer(t_sampl, n_sampl);
+                scoped_timer timer(t_sampl, n_sampl, prof_on);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
 
