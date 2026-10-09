@@ -22,27 +22,20 @@
 // The number of columns must be a multiple of the number of warps (columns per warp = ncols/nwarps).
 // Used by both AMD tables: the path only runs on RDNA, but the host compile pass instantiates the kernel template
 // against the generic AMD table (RDNA is a device-pass macro), so the same entries have to exist there.
-// GGML_HIP_FA_GQA6_VARIANT: 1 = 6 columns per warp (one K row and one V row read from shared memory serve six dot
-// products), 0 = 2 or 4 columns per warp, as the tuned configurations for 8, 16 and 32 columns have.
-#ifndef GGML_HIP_FA_GQA6_VARIANT
-#define GGML_HIP_FA_GQA6_VARIANT 1
-#endif // GGML_HIP_FA_GQA6_VARIANT
-
-#if GGML_HIP_FA_GQA6_VARIANT == 1
-#define GGML_CUDA_FATTN_TILE_CONFIG_GQA6                                 \
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6,  96, 6,  32, 256)     \
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12,  64, 8,  32, 256)     \
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 18,  96, 6,  32, 256)     \
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 128, 6,  32, 256)     \
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 30, 160, 5,  32, 256)
-#else
+// Measured on gfx1100 (RX 7900 XT) at 40960 cells of a q4_0 cache, us per call, with 2 x nsm x (blocks per SM) blocks:
+//   columns  threads  warps x columns   us     other layouts tried
+//      6        96       3 x 2          156    6 x 1: 180
+//     12       192       6 x 2          229    2 x 6: 306, 12 x 1: 293
+//     18        96       3 x 6          297    6 x 3: 314, 9 x 2: 327
+//     24       128       4 x 6          359    6 x 4: 371, 8 x 3: 367, 12 x 2: 394
+//     30       320      10 x 3          438    6 x 5: 441, 5 x 6: 491, 15 x 2: 492
+// A K tile of 128 instead of 256 values (two blocks per compute unit for 30 columns) did not help: 505.
 #define GGML_CUDA_FATTN_TILE_CONFIG_GQA6                                 \
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6,  96, 6,  32, 256)     \
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12, 192, 6,  32, 256)     \
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 18, 288, 4,  32, 256)     \
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 192, 5,  32, 256)     \
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 30, 480, 3,  32, 256)
-#endif // GGML_HIP_FA_GQA6_VARIANT == 1
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 18,  96, 6,  32, 256)     \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 128, 6,  32, 256)     \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 30, 320, 3,  32, 256)
 
 static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nvidia_fp16(const int DKQ, const int DV, const int ncols) {
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  2, 128, 3, 128,  40)
@@ -1413,9 +1406,14 @@ static void launch_fattn_tile_gqa6_case(ggml_backend_cuda_context & ctx, ggml_te
     const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2, cc);
     GGML_ASSERT(nwarps > 0 && (ncols1*ncols2) % nwarps == 0);
 
+    // Blocks in flight: the launcher fills nsm x (blocks per SM) and stops there. On gfx1100 nsm is 42, but twice that
+    // many blocks is the measured optimum for every one of these kernels (a reported SM holds two compute units):
+    // 5 queries at 41k cells 687 -> 491 us with the layout of that time, 1 to 4 queries 14 to 42% faster.
+    constexpr int blocks_per_sm_scale = 2;
+
     fattn_kernel_t fattn_kernel = ggml_cuda_fattn_tile_get_kernel<DKQ, DV, ncols1, ncols2, use_logit_softcap>(kv_q4_0);
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, !kv_q4_0, !kv_q4_0, false, false, warp_size);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, !kv_q4_0, !kv_q4_0, false, false, warp_size, false, blocks_per_sm_scale);
 }
 
 // returns false if the batch is not one this path handles

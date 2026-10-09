@@ -1562,7 +1562,8 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE, const bool allow_kv_batching = false
+    const int warp_size = WARP_SIZE, const bool allow_kv_batching = false,
+    const int blocks_per_sm_scale = 0 // [TAG_FATTN_GQA6] > 0: launch scale x nsm x (blocks per SM) blocks in total
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1786,6 +1787,11 @@ void launch_fattn(
                 efficiency_percent_best = efficiency_percent;
                 parallel_blocks = parallel_blocks_test;
             }
+        }
+
+        // [TAG_FATTN_GQA6] the caller asks for a fixed number of blocks in flight instead of the search above
+        if (blocks_per_sm_scale > 0) {
+            parallel_blocks = std::max(1, std::min((blocks_per_sm_scale*nsm*max_blocks_per_sm) / ntiles_dst, ntiles_KV));
         }
 
         // [TAG_FATTN_PROBE] tuning probe: GGML_HIP_FA_PARALLEL_BLOCKS=N sets the number of blocks along the KV axis,
