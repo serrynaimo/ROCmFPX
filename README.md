@@ -12,8 +12,8 @@ weights) plus a server-side prompt cache on SSD.
 
 - **A 27B model with 80k context on a 20 GB card.** ROCmFP4 weights (~15 GB)
   and a q4_0 KV cache: 18.9 GB at load.
-- **Fast decode.** The model's own MTP head drafts four tokens ahead: 44 t/s
-  on prose and 65 t/s on code, against 34 t/s without it.
+- **Fast decode.** The model's own MTP head drafts four tokens ahead: 47 t/s
+  on prose and 64 t/s on code, against 35 t/s without it.
 - **Switching conversations costs seconds, not minutes.** Qwen3.8 is a hybrid
   (16 attention + 49 recurrent layers), and recurrent state cannot be rolled
   back to an arbitrary prefix, so stock llama.cpp re-prefills a conversation
@@ -89,7 +89,7 @@ The server speaks the usual OpenAI-compatible API on `/v1`.
 | `-c 81920`, q4_0 KV | about what a 20 GB card holds; KV costs ~18 KB/token. Whatever does not fit, Windows silently pages to system RAM. We run `-c 106496` in production with 1.9 GB paged. |
 | `-np 1` | one full-size context is all that fits; the SSD cache shares it between agents. |
 | `-ub 256` | the smallest compute buffer that keeps prefill speed; larger ones take VRAM from the context. |
-| MTP draft, `n-max 4` | +27% decode on prose, +90% on code, for 1.4 GB of VRAM and 9% of prefill speed. |
+| MTP draft, `n-max 4` | +37% decode on prose, +85% on code, for 1.4 GB of VRAM and 9% of prefill speed. |
 | `--ctx-checkpoints 8` | kept in host RAM, ~200 MiB each. When the list is full, the one whose removal leaves the smallest gap is dropped; the one at the first user message never is. |
 | `--load-mode dio` | the default memory-mapped load keeps the 15 GB model file in system RAM. |
 | `--gpu-keepalive-ms 2000` | an idle card on a nearly full VRAM budget loses its resident memory and the next request crawls. |
@@ -99,19 +99,19 @@ The server speaks the usual OpenAI-compatible API on `/v1`.
 
 ## Speed
 
-Bench of 6 October 2026 at `-c 81920`: nine 450-token runs per decode row, one
-cold prompt per depth.
+Bench of 9 October 2026 at `-c 81920`: nine 450-token runs per decode row, one
+cold prompt per depth followed by a 300-token answer.
 
 | t/s | median | peak |
 |---|---:|---:|
-| decode, prose | 43.8 | 47.8 |
-| decode, code | 65.3 | 74.5 |
-| decode without MTP, prose or code | 34.4 | 34.4 |
+| decode, prose | 47.3 | 47.9 |
+| decode, code | 64.1 | 73.4 |
+| decode without MTP, prose or code | 34.6 | 34.7 |
 
-| cold prompt | 18k | 45k | 74k |
+| cold prompt | 17k | 41k | 69k |
 |---|---:|---:|---:|
-| prefill t/s, average over the prompt | 580 | 516 | 455 |
-| decode t/s at that depth | 43.2 | 35.9 | 34.3 |
+| prefill t/s, average over the prompt | 626 | 548 | 480 |
+| decode t/s at that depth | 40.6 | 31.5 | 26.8 |
 
 Production traffic, 2-6 October 2026 (718 agent requests at `-c 106496`), by
 context depth; requests generating 200+ tokens (decode) or evaluating 1,500+
