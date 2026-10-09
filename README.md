@@ -80,6 +80,7 @@ set "PATH=%HIP_PATH%bin;%PATH%"
 set GGML_CUDA_NO_PINNED=1
 set LLAMA_MAX_QUEUED=3
 set ROCMFPX_DRAFT_VOCAB=16384
+set GGML_HIP_FA_GQA6=1
 
 llama-server -m Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S.gguf --mmproj mmproj-Qwen3.8-27B-f16.gguf ^
   -dev ROCm0 -ngl 999 -fa on --jinja --load-mode dio --gpu-keepalive-ms 2000 ^
@@ -104,6 +105,7 @@ The server speaks the usual OpenAI-compatible API on `/v1`.
 | `-ub 1024` | prefill +6% at 17k and +11% at 41k over 256, for 0.3 GB more paged memory; 512 gives +4% and +8% for 0.1 GB. Decode does not change with it (55.7 against 56.0 t/s on identical text). |
 | MTP draft, `n-max 4` | +45% decode on prose, +112% on code, for 1.4 GB of VRAM and 3% of prefill speed. The draft head has its own KV cache; for prompt tokens only its K and V are computed, nothing else of the block is ever read. |
 | `ROCMFPX_DRAFT_VOCAB=16384` | a drafted token is scored against 16,384 candidate tokens instead of all 248,320: half fixed, half the main model's own top tokens at the previous position, per slot. 0.12 ms instead of 1.9 ms per drafted token; the main model still verifies each one against the full vocabulary. Decode +9% on a short context, +3 to 5% at 41k. A verbatim copy drafts slightly less (acceptance 0.99 to 0.96), ordinary text the same. |
+| `GGML_HIP_FA_GQA6=1` | attention for decode batches of 1 to 5 tokens: one GPU block per KV head with all six of its query heads, instead of three groups of two and a batch padded to 8. Decode +10 to 12% at 41k, +2 to 6% at 17k, nothing at a short context. Qwen3.5/3.8-27B on RDNA only (head size 256, 24 query heads on 4 KV heads). |
 | `--ctx-checkpoints 8` | kept in host RAM, ~200 MiB each. When the list is full, the one whose removal leaves the smallest gap is dropped; the one at the first user message never is. |
 | `--load-mode dio` | the default memory-mapped load keeps the 15 GB model file in system RAM. |
 | `--gpu-keepalive-ms 2000` | an idle card on a nearly full VRAM budget loses its resident memory and the next request crawls. |
@@ -113,8 +115,8 @@ The server speaks the usual OpenAI-compatible API on `/v1`.
 
 ## Speed
 
-Measured on 9 October 2026 at the production shape (`-c 106496`, two slots,
-`-ub 1024`, vision projector on the CPU, draft vocabulary 16384).
+Measured on 9 and 10 October 2026 at the production shape (`-c 106496`, two
+slots, `-ub 1024`, vision projector on the CPU, draft vocabulary 16384).
 
 Nine 450-token runs per row at temperature 1, on the production server while
 it was idle:
@@ -125,18 +127,19 @@ it was idle:
 | code | 73.4 | 81.8 | 62.0 | 0.73 |
 | without MTP, prose or code | 34.6 | 34.7 | | |
 
-Code decodes faster than prose because more of the draft is accepted. That
-morning, before the three decode changes listed below, the same prompts gave
-47.3 for prose and 64.1 for code; the row without MTP is from that morning.
+Code decodes faster than prose because more of the draft is accepted. On the
+morning of 9 October, before the decode changes listed below, the same prompts
+gave 47.3 for prose and 64.1 for code; the row without MTP is from that
+morning. The table predates the last change (attention at depth), which does
+nothing at this depth: 51.0 and 74.3 with it on a test server.
 
 At temperature 0 on fixed prompts, which is what the step tables below use:
 
 | decode t/s | |
 |---|---:|
-| prose, short context (three 450-token runs) | 53.8 |
-| the 260-token answer to a cold 17k prompt | 53.4 |
-| at 41k depth (three 300-token turns) | 50.7 |
-| verbatim copy of a passage at 41k | 73.1 |
+| the 260-token answer to a cold 17k prompt | 54.7 |
+| at 41k depth (three 300-token turns) | 55.9 |
+| verbatim copy of a passage at 41k | 82.2 |
 
 | cold prompt | 17k | 41k |
 |---|---:|---:|
@@ -157,7 +160,7 @@ after. It also runs after every verified batch during decode, which made those
 four turns 2 to 5% faster (44.1 / 52.5 / 55.9 / 45.8 t/s before, 45.2 / 54.0 /
 58.6 / 46.7 after).
 
-What moved decode that evening, each step on top of the one above:
+What moved decode, each step on top of the one above:
 
 | decode t/s | prose, short context | at 41k depth | verbatim copy at 41k |
 |---|---:|---:|---:|
@@ -165,6 +168,7 @@ What moved decode that evening, each step on top of the one above:
 | attention reads the q4_0 cache directly | 48.9 | 47.8 | 69.4 |
 | one graph arena per verify-batch size | 49.5 | 49.2 | 69.4 |
 | draft scores 16,384 candidate tokens | 53.8 | 50.7 | 73.1 |
+| attention: six query heads per block, exact batch size | 50.8 | 55.9 | 82.2 |
 
 Attention: a batch of one to eight tokens on a q4_0 cache went to a kernel 1.6
 to 2.3 times slower than the tile kernel is on f16. The tile kernel now expands
@@ -179,6 +183,30 @@ on ordinary text did not move (0.63 to 0.64); on the verbatim copy it fell from
 0.99 to 0.96. The text of the 41k column differs between the last two rows
 (the draft pattern decides which near-ties win), the copy column is the same
 text in every row.
+
+Attention at depth: the model has 24 query heads on 4 KV heads. The tile
+kernel handled that as three groups of two heads per KV head, so every K/V
+tile was loaded and expanded three times, and it ran a batch of five tokens as
+eight. Decode batches of one to five tokens now get one block per KV head with
+all six query heads and the exact batch size. Two things had to be tuned on
+the card: the launcher started half as many blocks as the GPU can use (it
+sizes the launch for the 42 processors the driver reports, and twice that is
+the optimum for every one of these kernels), and the best thread layout differs
+per batch size. One attention call over 41k cells of a q4_0 cache, in
+microseconds, before and after:
+
+| tokens in the batch | 1 | 2 | 3 | 4 | 5 |
+|---|---:|---:|---:|---:|---:|
+| before | 263 | 462 | 588 | 578 | 872 |
+| after | 159 | 231 | 301 | 363 | 451 |
+
+The results match the CPU reference in all 50 test cases, and draft acceptance
+does not change (nine prose and nine code runs at temperature 1: 0.61 and 0.74
+with it, 0.59 and 0.79 without, inside the run-to-run spread). The verify pass
+at 41k drops from 47-49 ms to 44 ms; on a short context it is the same 34-36
+ms, and the 50.8 in the first column is a different text with fewer accepted
+drafts (0.61 against 0.64), not a slower pass. On the production server the
+copy test ran at 80.4 t/s after the deploy.
 
 Where decode time goes: a pass reads the 15 GB of weights once, whatever the
 number of tokens in it. With one to three tokens the ROCmFP4 kernel moves
@@ -222,8 +250,10 @@ changes above):
 | decode t/s at 17k depth | 50 | 36 | 51 |
 
 Two slots working at the same moment share the GPU, not its speed: both
-decoding gives 26 to 28 t/s each (one alone: 55), and a slot decoding while the
+decoding gives 24 to 28 t/s each (one alone: 55), and a slot decoding while the
 other prefills a cold 17k prompt gets about 10 t/s until that prefill is done.
+Each slot gets its own pass over the weights: a loop with both decoding takes
+84 ms, exactly two single-slot loops.
 Both conversations stay warm.
 
 ## The SSD prompt cache

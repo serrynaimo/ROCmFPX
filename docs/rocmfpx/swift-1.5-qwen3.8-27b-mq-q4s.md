@@ -86,14 +86,15 @@ Perplexity, wikitext-2 test, 580 chunks, `-c 512 -b 512 -fa on`, f16 KV:
 | --- | ---: | ---: |
 | `MQ-Q4S` (61 tensors) | 7.1516 ± 0.048 | 14.97 |
 
-Speed and memory on 9 October 2026, served with `-c 106496` on two slots,
-q4_0 KV, MTP draft `n-max 4` over 16,384 candidate tokens
-(`ROCMFPX_DRAFT_VOCAB`), `-ub 1024`, vision `mmproj` on the CPU:
+Speed and memory on 9 and 10 October 2026, served with `-c 106496` on two
+slots, q4_0 KV, MTP draft `n-max 4` over 16,384 candidate tokens
+(`ROCMFPX_DRAFT_VOCAB`), six query heads per attention block
+(`GGML_HIP_FA_GQA6`), `-ub 1024`, vision `mmproj` on the CPU:
 
 | measure | value |
 | --- | ---: |
 | prose / code decode, MTP, tok/s, median (peak) | 50.1 (53.2) / 73.4 (81.8) |
-| decode at 41k depth, MTP, tok/s | 50.7 |
+| decode at 41k depth, MTP, tok/s | 55.9 |
 | decode without MTP, tok/s | 34.6 |
 | prefill of a cold 17k / 41k prompt, tok/s | 679 / 621 |
 | the same without the MTP draft, tok/s | 701 / 640 |
