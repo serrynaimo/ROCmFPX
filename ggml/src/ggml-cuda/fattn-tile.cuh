@@ -7,11 +7,6 @@
 // TODO optimize kernel parameters for FP16 NVIDIA (P100)
 // TODO optimize kernel parameters for head sizes 40, 72, 80, 96, 112
 
-// [TAG_FATTN_GQA6] which set of kernel configurations the 6-columns-per-query path uses, see the RDNA table
-#ifndef GGML_HIP_FA_GQA6_VARIANT
-#define GGML_HIP_FA_GQA6_VARIANT 1
-#endif // GGML_HIP_FA_GQA6_VARIANT
-
 // The ROCm compiler cannot handle templating in __launch_bounds__.
 // As a workaround, define a macro to package the kernel parameters as uint32_t:
 #define GGML_CUDA_FATTN_TILE_CONFIG_CASE(DKQ_, DV_, ncols_, nthreads, occupancy, nbatch_fa, nbatch_K) \
@@ -22,6 +17,32 @@
         static_assert((nbatch_K)          <= 256, "bad nbatch_K");                                    \
         return ((nthreads) << 0) | ((occupancy) << 10) | ((nbatch_fa) << 14) | ((nbatch_K) << 23);    \
     }                                                                                                 \
+
+// [TAG_FATTN_GQA6] a GQA ratio of 6 in one block per KV head, head size 256: 6 columns per query, 1 to 5 queries.
+// The number of columns must be a multiple of the number of warps (columns per warp = ncols/nwarps).
+// Used by both AMD tables: the path only runs on RDNA, but the host compile pass instantiates the kernel template
+// against the generic AMD table (RDNA is a device-pass macro), so the same entries have to exist there.
+// GGML_HIP_FA_GQA6_VARIANT: 1 = 6 columns per warp (one K row and one V row read from shared memory serve six dot
+// products), 0 = 2 or 4 columns per warp, as the tuned configurations for 8, 16 and 32 columns have.
+#ifndef GGML_HIP_FA_GQA6_VARIANT
+#define GGML_HIP_FA_GQA6_VARIANT 1
+#endif // GGML_HIP_FA_GQA6_VARIANT
+
+#if GGML_HIP_FA_GQA6_VARIANT == 1
+#define GGML_CUDA_FATTN_TILE_CONFIG_GQA6                                 \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6,  96, 6,  32, 256)     \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12,  64, 8,  32, 256)     \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 18,  96, 6,  32, 256)     \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 128, 6,  32, 256)     \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 30, 160, 5,  32, 256)
+#else
+#define GGML_CUDA_FATTN_TILE_CONFIG_GQA6                                 \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6,  96, 6,  32, 256)     \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12, 192, 6,  32, 256)     \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 18, 288, 4,  32, 256)     \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 192, 5,  32, 256)     \
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 30, 480, 3,  32, 256)
+#endif // GGML_HIP_FA_GQA6_VARIANT == 1
 
 static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nvidia_fp16(const int DKQ, const int DV, const int ncols) {
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  2, 128, 3, 128,  40)
@@ -223,6 +244,8 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  32, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  32, 128)
 
+    GGML_CUDA_FATTN_TILE_CONFIG_GQA6
+
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 32, 512, 1, 128,  64)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  2,  64, 2,  64,  64)
@@ -301,23 +324,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 5,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 3,  64, 128)
 
-    // [TAG_FATTN_GQA6] a GQA ratio of 6 in one block per KV head: 6 columns per query, 1 to 5 queries.
-    // The number of columns must be a multiple of the number of warps (columns per warp = ncols/nwarps).
-#if GGML_HIP_FA_GQA6_VARIANT == 1
-    // 6 columns per warp: one K row and one V row read from shared memory serve six dot products
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6,  96, 6,  32, 256) // 3 warps, 2 columns each
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12,  64, 8,  32, 256) // 2 warps
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 18,  96, 6,  32, 256) // 3 warps
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 128, 6,  32, 256) // 4 warps
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 30, 160, 5,  32, 256) // 5 warps
-#else
-    // 2 or 4 columns per warp, as the tuned configurations for 8, 16 and 32 columns have
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6,  96, 6,  32, 256) //  3 warps, 2 columns each
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12, 192, 6,  32, 256) //  6 warps, 2
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 18, 288, 4,  32, 256) //  9 warps, 2
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 192, 5,  32, 256) //  6 warps, 4
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 30, 480, 3,  32, 256) // 15 warps, 2
-#endif // GGML_HIP_FA_GQA6_VARIANT == 1
+    GGML_CUDA_FATTN_TILE_CONFIG_GQA6
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 32, 256, 2, 128,  64)
 
@@ -1380,7 +1387,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     GGML_ABORT("fatal error");
 }
 
-#if defined(GGML_USE_HIP) && defined(RDNA)
+#if defined(GGML_USE_HIP) && defined(FAST_FP16_AVAILABLE)
 // [TAG_FATTN_GQA6] Qwen3.5/3.8-27B: 24 query heads on 4 KV heads, head size 256. The generic path below treats a GQA
 // ratio of 6 as three groups of two heads, so every K/V tile is loaded (and, for a q4_0 cache, expanded) three times,
 // and a batch of 5 queries is padded to 8 columns. This path gives each KV head one block with all 6 of its query
@@ -1427,7 +1434,7 @@ static bool launch_fattn_tile_gqa6(ggml_backend_cuda_context & ctx, ggml_tensor 
         default: return false;
     }
 }
-#endif // defined(GGML_USE_HIP) && defined(RDNA)
+#endif // defined(GGML_USE_HIP) && defined(FAST_FP16_AVAILABLE)
 
 template <int DKQ, int DV, bool use_logit_softcap>
 static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1492,15 +1499,16 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     }
 
     if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
-#if defined(GGML_USE_HIP) && defined(RDNA)
-        // [TAG_FATTN_GQA6] six query heads per KV head, 1 to 5 queries: one block per KV head
+#if defined(GGML_USE_HIP) && defined(FAST_FP16_AVAILABLE)
+        // [TAG_FATTN_GQA6] six query heads per KV head, 1 to 5 queries: one block per KV head (RDNA only)
         if constexpr (DKQ == 256 && DV == 256 && !use_logit_softcap) {
             if (use_gqa_opt && gqa_ratio == 6 && ggml_cuda_fattn_tile_gqa6_mode() > 0 &&
+                    GGML_CUDA_CC_IS_RDNA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
                     launch_fattn_tile_gqa6<DKQ, DV, use_logit_softcap>(ctx, dst)) {
                 return;
             }
         }
-#endif // defined(GGML_USE_HIP) && defined(RDNA)
+#endif // defined(GGML_USE_HIP) && defined(FAST_FP16_AVAILABLE)
 
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
