@@ -27,8 +27,11 @@ weights) plus a server-side prompt cache on SSD.
   | prompt diverges from the cached one before its end, 25-34k | 45-62 s | 7.5 s (6.5-10) |
   | first request after a server restart, 18-27k | 30-50 s | 4.2 s (1.0-10.9) |
 
-- **One slot serves several agents.** 20 GB holds exactly one full-size context;
-  the cache is what makes `-np 1` workable for an orchestrator and its workers.
+- **Two slots on one shared KV pool.** An orchestrator's chat turn no longer
+  waits behind a worker's long run. A request starts beside a running one only
+  when both keep 12k tokens of generation room, otherwise it queues; a
+  conversation that has to give up its cells is saved to SSD first, so nothing
+  is lost when the pool fills. More agents than slots is what the cache is for.
 - **Shared system prompts.** States are saved every 4096 tokens inside the
   system prompt + tools block and at its end. Any conversation that starts with
   the same tokens resumes from the deepest state it still shares.
@@ -73,12 +76,13 @@ set LLAMA_MAX_QUEUED=3
 
 llama-server -m Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S.gguf --mmproj mmproj-Qwen3.8-27B-f16.gguf ^
   -dev ROCm0 -ngl 999 -fa on --jinja --load-mode dio --gpu-keepalive-ms 2000 ^
-  -c 81920 -np 1 -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -b 2048 -ub 256 ^
+  -c 81920 -np 2 --kv-unified --kv-unified-reserve 12288 --no-cache-idle-slots ^
+  -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -b 2048 -ub 256 --no-mmproj-offload ^
   --ctx-checkpoints 8 --checkpoint-min-step 2048 ^
   --cache-ram 0 --cache-disk D:\llama-cache --cache-disk-limit 65536 --cache-disk-checkpoints 4 ^
   --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.60 ^
   --chat-template-kwargs "{\"reasoning_effort\":\"low\"}" ^
-  --no-reasoning-preserve --temp 1 --sleep-idle-seconds -1 ^
+  --reasoning-preserve --temp 1 --sleep-idle-seconds -1 ^
   --alias qwen/qwen3.8-27b --host 0.0.0.0 --port 1234 --api-key-file api-keys.txt
 ```
 
@@ -86,14 +90,16 @@ The server speaks the usual OpenAI-compatible API on `/v1`.
 
 | setting | why |
 |---|---|
-| `-c 81920`, q4_0 KV | about what a 20 GB card holds; KV costs ~18 KB/token. Whatever does not fit, Windows silently pages to system RAM. We run `-c 106496` in production with 1.9 GB paged. |
-| `-np 1` | one full-size context is all that fits; the SSD cache shares it between agents. |
+| `-c 81920`, q4_0 KV | about what a 20 GB card holds; KV costs ~18 KB/token. Whatever does not fit, Windows silently pages to system RAM. We run `-c 106496` in production: 18.8 GB resident, 0.5 GB paged. |
+| `-np 2 --kv-unified --kv-unified-reserve 12288` | two slots share one pool instead of splitting it. The reserve admits a second request only while both can still generate 12k tokens, else it waits in the queue; idle slots are saved to the cache before their cells are taken. Without it a full pool fails both requests and wipes both contexts. |
+| `--no-cache-idle-slots` | keeps the idle conversation resident; the default saves and clears it at every new task, which leaves one live conversation. |
+| `--no-mmproj-offload` | the 0.9 GB vision projector was the whole paged share at two slots. Images cost 7-12 s to the first token instead of 3-5 s. |
 | `-ub 256` | the smallest compute buffer that keeps prefill speed; larger ones take VRAM from the context. |
 | MTP draft, `n-max 4` | +37% decode on prose, +85% on code, for 1.4 GB of VRAM and 9% of prefill speed. |
 | `--ctx-checkpoints 8` | kept in host RAM, ~200 MiB each. When the list is full, the one whose removal leaves the smallest gap is dropped; the one at the first user message never is. |
 | `--load-mode dio` | the default memory-mapped load keeps the 15 GB model file in system RAM. |
 | `--gpu-keepalive-ms 2000` | an idle card on a nearly full VRAM budget loses its resident memory and the next request crawls. |
-| `--no-reasoning-preserve` | otherwise the template keeps the thinking of every past turn: a permanent context tax. |
+| `--reasoning-preserve` | with a client that does not echo thinking, every past assistant turn renders as an empty think block (~4 tokens). Without it the template renders the previous turn differently once a new user message arrives, so a tool-using turn was re-prefilled (median 5k tokens) on every exchange. |
 | `GGML_CUDA_NO_PINNED=1` | pinned host memory makes more of the model page out, for no speed gain. |
 | `--temp 1` | Qwen3.8 degrades under greedy decoding. |
 
@@ -129,6 +135,11 @@ a cold prefill at these speeds.
 
 The slope is attention over the growing KV cache; the recurrent layers cost
 the same at any depth. The first and last rows rest on 3-14 requests each.
+
+Two slots share the GPU, not its speed: a chat turn arriving while the other
+slot decodes gets its first token in 1.6 s and then 17 t/s, the other drops
+from 46 to 31; a slot decoding while the other prefills a cold 30k prompt
+falls to about 6 t/s until that prefill is done. Both conversations stay warm.
 
 ## The SSD prompt cache
 
