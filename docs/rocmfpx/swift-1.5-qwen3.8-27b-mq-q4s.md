@@ -86,14 +86,17 @@ Perplexity, wikitext-2 test, 580 chunks, `-c 512 -b 512 -fa on`, f16 KV:
 | --- | ---: | ---: |
 | `MQ-Q4S` (61 tensors) | 7.1516 ± 0.048 | 14.97 |
 
-Speed and memory, served with `-c 81920`, q4_0 KV, MTP draft `n-max 4`,
-`-ub 256`, with the vision `mmproj` loaded (9 October 2026; VRAM from 6 October):
+Speed and memory on 9 October 2026, served with `-c 106496` on two slots,
+q4_0 KV, MTP draft `n-max 4` over 16,384 candidate tokens
+(`ROCMFPX_DRAFT_VOCAB`), `-ub 1024`, vision `mmproj` on the CPU:
 
 | measure | value |
 | --- | ---: |
-| prose / code decode, MTP, tok/s, median (peak) | 47.3 (47.9) / 64.1 (73.4) |
-| prefill of a cold 17k / 41k / 69k prompt, tok/s | 626 / 548 / 480 |
-| VRAM after a 45k prefill, GB | 18.11 dedicated + 0.89 shared |
+| prose decode with MTP, short context / at 41k depth, tok/s | 53.8 / 50.7 |
+| prose decode without MTP, tok/s | 34.6 |
+| prefill of a cold 17k / 41k prompt, tok/s | 679 / 621 |
+| the same without the MTP draft, tok/s | 701 / 640 |
+| VRAM at load, GB | 18.89 dedicated + 0.79 shared |
 
 Reasoning effort, 50 runs per setting (4 tool-calling agentic tasks x 3,
 10 reasoning tasks x 2, 9 harder python-verified tasks x 2, temperature 1,
