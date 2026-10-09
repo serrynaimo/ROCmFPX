@@ -256,6 +256,33 @@ Each slot gets its own pass over the weights: a loop with both decoding takes
 84 ms, exactly two single-slot loops.
 Both conversations stay warm.
 
+## Other cards
+
+Everything above is tuned and measured on an RX 7900 XT. The project still runs
+elsewhere; the card-specific fast paths are gated so that other hardware keeps
+the stock behaviour.
+
+- **Any backend (CPU, Vulkan, other GPUs).** The slot ranges on the shared
+  pool, the MTP changes, the draft vocabulary, the graph arenas and the SSD
+  prompt cache live in the model core and the server and do not depend on the
+  GPU. The tree builds with gcc and the Vulkan backend (checked on 10 October
+  2026).
+- **AMD cards with HIP.** The GPU backend builds for the gfx11 targets: RDNA3
+  (RX 7000 series) and RDNA3.5 (gfx1151, checked on 10 October 2026). It does
+  not build for RDNA2 or RDNA4 targets, because the bf16 matmul file inherited
+  from ROCmFPX uses RDNA3-only instructions. That limit predates the work
+  described here.
+- **Fast paths for the RX 7900 series.**
+  - Attention that reads a q4_0 KV cache directly is on by default only for
+    RDNA3 desktop cards (RX 7900, 7800, 7700, 7600). `GGML_HIP_FA_Q4_TILE=1`
+    turns it on for any HIP card, `=0` turns it off everywhere.
+  - `GGML_HIP_FA_GQA6=1` (six query heads per attention block) is opt-in and
+    runs on RDNA cards only. Its thread layouts and block counts were tuned on
+    gfx1100.
+- **Settings.** `-c`, `-ub 1024` and the VRAM split in this README are sized
+  for 20 GB of VRAM. The speed tables are for the RX 7900 XT and will differ on
+  other cards.
+
 ## The SSD prompt cache
 
 Off unless `--cache-disk` is given. Everything else has a working default.
