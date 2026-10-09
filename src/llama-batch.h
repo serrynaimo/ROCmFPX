@@ -144,6 +144,10 @@ public:
     uint32_t get_n_outputs() const;
     uint32_t get_n_used()    const;
 
+    // [TAG_SHARED_PASS] true if the batch holds two or more sequences of the same length, every token in exactly one
+    // sequence, and at most n_max tokens in total
+    bool seqs_equal_len(uint32_t n_max) const;
+
     // the array of output indices in the order they were encountered during the ubatch splitting
     std::vector<int32_t> & get_out_ids();
 

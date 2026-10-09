@@ -71,6 +71,10 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
     do {
         balloc.split_reset();
 
+        // [TAG_KV_LANES] one sequence per ubatch, so that each ubatch attends only to its own lane
+        // [TAG_SHARED_PASS] unless the batch is sequences of equal length that fit one small ubatch: they share the pass
+        const uint32_t n_seq_cap = !mem_attn->get_lanes() ? 0 : (balloc.seqs_equal_len(mem_attn->get_lanes_merge()) ? 0 : 1);
+
         // follow the recurrent pattern for creating the ubatch splits
         std::vector<llama_ubatch> ubatches;
 
@@ -90,7 +94,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
                 // [TAG_KV_LANES] one sequence per ubatch, so that each ubatch attends only to its own lane
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, mem_attn->get_lanes() ? 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, n_seq_cap);
             }
 
             if (ubatch.n_tokens == 0) {

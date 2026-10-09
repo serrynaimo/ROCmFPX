@@ -484,6 +484,8 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
 
+    set_input_seq_masks(mctx, ubatch);
+
     if (self_k_rot && self_k_rot->buffer) {
         mctx->set_input_k_rot(self_k_rot);
     }
@@ -503,12 +505,42 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
-
-    // [TAG_KV_LANES] the offset of the K/V views is part of the graph
-    res &= kv_off == mctx->get_kv_off();
+    res &= can_reuse_masks(mctx, params);
 
     return res;
+}
+
+// [TAG_SHARED_PASS]
+void llm_graph_input_attn_kv::set_input_seq_masks(const llama_kv_cache_context * mctx_cur, const llama_ubatch * ubatch) {
+    for (size_t s = 0; s < seq_kq_mask.size(); ++s) {
+        // not allocated when the graph only stores K/V
+        if (seq_kq_mask[s] && seq_kq_mask[s]->buffer) {
+            mctx_cur->set_input_kq_mask_seq(seq_kq_mask[s], ubatch, cparams.causal_attn, (uint32_t) s);
+        }
+    }
+}
+
+bool llm_graph_input_attn_kv::can_reuse_masks(const llama_kv_cache_context * mctx_cur, const llm_graph_params & params) const {
+    const uint32_t n_ranges = mctx_cur->get_n_ranges();
+
+    if (n_ranges > 1 || !seq_kq_mask.empty()) {
+        if (n_ranges < 2 || seq_kq_mask.size() != n_ranges) {
+            return false;
+        }
+
+        bool res = true;
+
+        for (uint32_t s = 0; s < n_ranges; ++s) {
+            res &= seq_kq_mask[s]->ne[0] == (int64_t) mctx_cur->get_n_kv(s);
+            res &= seq_kq_mask[s]->ne[1] == (int64_t) (params.ubatch.n_tokens/n_ranges);
+            res &= seq_kv_off[s] == mctx_cur->get_kv_off(s);
+        }
+
+        return res;
+    }
+
+    // [TAG_KV_LANES] the offset of the K/V views is part of the graph
+    return can_reuse_kq_mask(self_kq_mask, mctx_cur, params.ubatch, params.cparams) && kv_off == mctx_cur->get_kv_off();
 }
 
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
@@ -1113,6 +1145,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
     }
 
+    inp_attn->set_input_seq_masks(mctx->get_attn(), ubatch);
+
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
     }
@@ -1144,10 +1178,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
-
-    // [TAG_KV_LANES] the offset of the K/V views is part of the graph
-    res &= inp_attn->kv_off == mctx->get_attn()->get_kv_off();
+    res &= inp_attn->can_reuse_masks(mctx->get_attn(), params);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2922,8 +2953,27 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
-        inp->self_kq_mask_cnv = inp->self_kq_mask;
+        // [TAG_SHARED_PASS] a ubatch that merges sequences: one mask per sequence block, against the range of that sequence
+        const uint32_t n_ranges = mctx_cur->get_n_ranges();
+
+        if (n_ranges > 1) {
+            GGML_ASSERT(cparams.kv_unified && ubatch.n_tokens % n_ranges == 0);
+
+            // flash attention requires an f16 mask
+            const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
+            for (uint32_t s = 0; s < n_ranges; ++s) {
+                ggml_tensor * mask = ggml_new_tensor_4d(ctx0, type, mctx_cur->get_n_kv(s), ubatch.n_tokens/n_ranges, 1, 1);
+                ggml_set_input(mask);
+                ggml_set_name(mask, "attn_inp_kq_mask_seq");
+
+                inp->seq_kq_mask.push_back(mask);
+                inp->seq_kv_off .push_back(mctx_cur->get_kv_off(s));
+            }
+        } else {
+            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+            inp->self_kq_mask_cnv = inp->self_kq_mask;
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -3025,7 +3075,32 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = nullptr;
+
+    if (!inp->seq_kq_mask.empty()) {
+        // [TAG_SHARED_PASS] the ubatch merges several sequences: the tokens of each one attend to its own range of cells.
+        // K and V of all tokens are stored above, and everything outside attention runs once for the whole ubatch.
+        GGML_ASSERT(!cparams.training);
+
+        const int64_t n_ranges = (int64_t) inp->seq_kq_mask.size();
+
+        // q is [n_embd_head, n_head, n_tokens], the tokens laid out block by block
+        GGML_ASSERT(q->ne[3] == 1 && q->ne[2] % n_ranges == 0);
+
+        const int64_t n_tok = q->ne[2] / n_ranges;
+
+        for (int64_t s = 0; s < n_ranges; ++s) {
+            ggml_tensor * q_s = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], n_tok, q->nb[1], q->nb[2], s*n_tok*q->nb[2]);
+            ggml_tensor * k_s = mctx_cur->get_k(ctx0, il, (uint32_t) s);
+            ggml_tensor * v_s = mctx_cur->get_v(ctx0, il, (uint32_t) s);
+
+            ggml_tensor * cur_s = build_attn_mha(q_s, k_s, v_s, kq_b, inp->seq_kq_mask[s], sinks, v_mla, 0, kq_scale, il);
+
+            cur = s == 0 ? cur_s : ggml_concat(ctx0, cur, cur_s, 1);
+        }
+    } else {
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

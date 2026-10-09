@@ -206,6 +206,19 @@ public:
     void set_lanes(bool enable);
     bool get_lanes() const { return lanes; }
 
+    // [TAG_SHARED_PASS] with lanes, a ubatch normally holds one sequence. With a merge limit of n > 0, sequences of equal
+    // length are decoded in one ubatch of at most n tokens: the weights are read once for all of them and the graph
+    // attends per sequence (get_kv_ranges()). Only for owners whose graph builds attention per range.
+    void     set_lanes_merge(uint32_t n_max) { lanes_merge = lanes ? n_max : 0; }
+    uint32_t get_lanes_merge() const { return lanes_merge; }
+
+    // the ubatch as blocks of n_tokens/n_blocks consecutive tokens, one sequence per block: the number of blocks if the
+    // ubatch holds several sequences of a cache with lanes, else 1
+    uint32_t get_n_seq_blocks(const llama_ubatch & ubatch) const;
+
+    // one range per block of the ubatch, see get_n_seq_blocks(); a single block has the range of get_kv_range()
+    std::vector<kv_range> get_kv_ranges(const slot_info & sinfo, const llama_ubatch & ubatch) const;
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t kv_off = 0) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t kv_off = 0) const;
@@ -229,6 +242,9 @@ public:
     // return empty slot_info on failure
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
+    // [TAG_SHARED_PASS] find_slot() for a ubatch of several sequences of a cache with lanes: each one in its own lane
+    slot_info find_slot_lanes_multi(const llama_ubatch & ubatch, bool cont) const;
+
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
@@ -247,7 +263,9 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_off = 0) const;
+    // [TAG_SHARED_PASS] with n_tok > 0 the mask covers the n_tok tokens from i_tok0 on, dst is [n_kv, n_tok]
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_off = 0,
+                              uint32_t i_tok0 = 0, uint32_t n_tok = 0) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -308,6 +326,9 @@ private:
 
     // [TAG_KV_LANES] one range of cells per sequence, see kv_lane_head()
     bool lanes = false;
+
+    // [TAG_SHARED_PASS] max. tokens of a ubatch that merges sequences of equal length, 0 = one sequence per ubatch
+    uint32_t lanes_merge = 0;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
@@ -420,6 +441,15 @@ public:
     // [TAG_KV_LANES] index of the first cell of the K/V views, the mask is relative to it
     uint32_t get_kv_off() const;
 
+    // [TAG_SHARED_PASS] the ranges of the current ubatch: one, or one per sequence block (see llama_kv_cache)
+    uint32_t get_n_ranges() const;
+    uint32_t get_n_kv(uint32_t s) const;
+    uint32_t get_kv_off(uint32_t s) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t s) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t s) const;
+    // the mask of the tokens of block s against the range of block s, dst is [get_n_kv(s), n_tokens/get_n_ranges()]
+    void set_input_kq_mask_seq(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t s) const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -493,4 +523,7 @@ private:
 
     // [TAG_KV_LANES] first cell of the attended range, 0 without lanes
     uint32_t kv_off = 0;
+
+    // [TAG_SHARED_PASS] more than one entry only for a ubatch that merges sequences
+    std::vector<llama_kv_cache::kv_range> ranges;
 };

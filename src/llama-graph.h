@@ -355,6 +355,14 @@ public:
     // [TAG_KV_LANES] the first cell of the K/V views that this graph was built with
     uint32_t kv_off = 0;
 
+    // [TAG_SHARED_PASS] a ubatch that merges sequences of a cache with lanes: one mask per sequence block against its own
+    // range of cells. self_kq_mask is not created then.
+    std::vector<ggml_tensor *> seq_kq_mask; // F32/F16 [n_kv(s), n_batch/n_blocks]
+    std::vector<uint32_t>      seq_kv_off;
+
+    void set_input_seq_masks(const llama_kv_cache_context * mctx_cur, const llama_ubatch * ubatch);
+    bool can_reuse_masks(const llama_kv_cache_context * mctx_cur, const llm_graph_params & params) const;
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return

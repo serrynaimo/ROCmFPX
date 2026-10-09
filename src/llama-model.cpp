@@ -2951,6 +2951,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     }
+
+                    // [TAG_SHARED_PASS] LLAMA_KV_LANES_MERGE=n: slots that decode batches of equal length share one pass
+                    // of at most n tokens. Qwen3.x only: its graph builds attention per sequence range.
+                    if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
+                        const char * env = getenv("LLAMA_KV_LANES_MERGE");
+                        auto * hybrid = dynamic_cast<llama_memory_hybrid *>(res);
+                        if (hybrid && env && atoi(env) > 0) {
+                            hybrid->get_mem_attn()->set_lanes_merge((uint32_t) atoi(env));
+                        }
+                    }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
                     llama_memory_i::layer_reuse_cb reuse = nullptr;

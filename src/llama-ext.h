@@ -94,6 +94,10 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // its own range of cells, so that a sequence does not pay for the cells of the others
 LLAMA_API bool llama_kv_lanes_enabled(const struct llama_context * ctx);
 
+// [TAG_SHARED_PASS] > 0 if sequences that decode batches of equal length share one pass: the max. number of tokens of
+// such a merged batch. 0 = every sequence gets its own pass
+LLAMA_API uint32_t llama_kv_lanes_merge_max(const struct llama_context * ctx);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

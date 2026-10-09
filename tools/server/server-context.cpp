@@ -1351,6 +1351,12 @@ private:
         if (llama_kv_lanes_enabled(ctx_tgt)) {
             SRV_INF("shared KV pool: each of the %d slots has its own range of cells, attention covers only the cells of the active slot\n",
                     params_base.n_parallel);
+
+            // [TAG_SHARED_PASS]
+            if (llama_kv_lanes_merge_max(ctx_tgt) > 0) {
+                SRV_INF("shared KV pool: slots that decode batches of the same length share one pass of up to %u tokens\n",
+                        llama_kv_lanes_merge_max(ctx_tgt));
+            }
         }
 
         // initialize slots

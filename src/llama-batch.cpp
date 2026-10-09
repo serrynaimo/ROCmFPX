@@ -539,6 +539,25 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
+// [TAG_SHARED_PASS]
+bool llama_batch_allocr::seqs_equal_len(uint32_t n_max) const {
+    if (n_max == 0 || has_cpl || (uint32_t) batch.n_tokens > n_max || seq_set_map.size() < 2) {
+        return false;
+    }
+
+    size_t n = 0;
+
+    for (const auto & it : seq_set_map) {
+        if (it.first.count() != 1 || it.second.empty() || (n != 0 && it.second.size() != n)) {
+            return false;
+        }
+
+        n = it.second.size();
+    }
+
+    return true;
+}
+
 llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, uint32_t n_seq_cap) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);

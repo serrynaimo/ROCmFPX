@@ -1723,6 +1723,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // [TAG_SHARED_PASS] slots that decode together share one target pass when their verify batches have the same length.
+        // While the target merges such batches, the sequences draft in lockstep: one whose next token is below p_min keeps
+        // drafting as long as another one is still confident (a few more columns are cheap in a shared pass, a second
+        // pass is not), and the draft length is capped so that all verify batches fit the merged pass.
+        const int  n_merge_max = (int) llama_kv_lanes_merge_max(params.ctx_tgt);
+        const bool lockstep    = n_merge_max > 0 && n_drafting >= 2 && !chain_heads && !is_mem_shared;
+        const int  n_max_step  = lockstep ? std::min((int) params.n_max, std::max(1, n_merge_max / n_drafting - 1)) : (int) params.n_max;
+
         int i = 0;
         std::vector<float> cum_hold(n_seq, 0.0f);
 
@@ -1753,6 +1761,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // new token (the KV already holds the prefix), while chained heads re-add the
             // whole prefix at the next head. dropped sequences are simply not re-added.
             batch.clear();
+
+            // [TAG_SHARED_PASS] first the next token of every sequence, then the decisions: lockstep has to know whether
+            // any sequence is still confident before one of them is dropped
+            std::vector<llama_token> step_id(n_seq, LLAMA_TOKEN_NULL);
+            std::vector<float>       step_p (n_seq, 0.0f);
+            std::vector<std::vector<llama_token_data>> step_q(n_seq);
+            bool any_strong = false;
 
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (!drafting[seq_id]) {
@@ -1792,6 +1807,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     q_row.assign(cur_p->data, cur_p->data + cur_p->size);
                 }
                 }
+
+                step_id[seq_id] = id;
+                step_p [seq_id] = p_top;
+                step_q [seq_id] = std::move(q_row);
+
+                any_strong = any_strong || p_top >= params.p_min;
+            }
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (!drafting[seq_id]) {
+                    continue;
+                }
+
+                auto * smpl = smpls[seq_id].get();
+
+                const llama_token id    = step_id[seq_id];
+                const float       p_top = step_p [seq_id];
+                std::vector<llama_token_data> q_row = std::move(step_q[seq_id]);
+
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
@@ -1813,7 +1847,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         n_drafting--;
                         continue;
                     }
-                } else if (p_top < params.p_min) {
+                } else if (p_top < params.p_min && !(lockstep && any_strong)) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1826,7 +1860,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->push_back(std::move(q_row)); // one distribution per drafted token, always in step with result
                 }
 
-                if (rocmfpx_cum_p <= 0.0f && params.n_max <= (int) result.size()) {
+                if (rocmfpx_cum_p <= 0.0f && n_max_step <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;

@@ -1068,6 +1068,11 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         }
     }
 
+    // [TAG_SHARED_PASS] several sequences of a cache with lanes: each one allocates in its own lane
+    if (get_n_seq_blocks(ubatch) > 1) {
+        return find_slot_lanes_multi(ubatch, cont);
+    }
+
     uint32_t n_tokens = ubatch.n_tokens;
     uint32_t n_seqs   = 1;
 
@@ -1200,6 +1205,117 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     }
 
     assert(res.s1 >= res.s0);
+
+    return res;
+}
+
+// [TAG_SHARED_PASS]
+uint32_t llama_kv_cache::get_n_seq_blocks(const llama_ubatch & ubatch) const {
+    if (!lanes || n_stream != 1 || ubatch.n_seqs_unq < 2) {
+        return 1;
+    }
+
+    const uint32_t n_blocks = ubatch.n_seqs_unq;
+
+    // the equal split lays the tokens out sequence by sequence; anything else stays one block
+    if (!ubatch.equal_seqs() || ubatch.n_tokens % n_blocks != 0) {
+        return 1;
+    }
+
+    const uint32_t n_tok = ubatch.n_tokens / n_blocks;
+
+    for (uint32_t s = 0; s < n_blocks; ++s) {
+        const llama_seq_id seq_id = ubatch.seq_id[s*n_tok][0];
+
+        for (uint32_t i = 0; i < n_tok; ++i) {
+            if (ubatch.n_seq_id[s*n_tok + i] != 1 || ubatch.seq_id[s*n_tok + i][0] != seq_id) {
+                return 1;
+            }
+        }
+    }
+
+    return n_blocks;
+}
+
+// [TAG_SHARED_PASS] The cells of a block come from the lane of its sequence, in the order of the tokens. The cells picked
+// for one block are not marked as used until apply_ubatch(), so the next block must not pick them again: possible only
+// when the pool is nearly full and two lanes meet.
+llama_kv_cache::slot_info llama_kv_cache::find_slot_lanes_multi(const llama_ubatch & ubatch, bool cont) const {
+    const auto & cells = v_cells[0];
+
+    const uint32_t n_blocks = get_n_seq_blocks(ubatch);
+    const uint32_t n_tok    = ubatch.n_tokens / n_blocks;
+
+    if (ubatch.n_tokens > cells.size()) {
+        LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, ubatch.n_tokens, cells.size());
+        return { };
+    }
+
+    slot_info res = {
+        /*.s0   =*/ 0,
+        /*.s1   =*/ 0,
+        /*.strm =*/ { },
+        /*.idxs =*/ { },
+    };
+
+    res.resize(1);
+    res.strm[0] = 0;
+    res.idxs[0].reserve(ubatch.n_tokens);
+
+    std::vector<uint32_t> taken; // sorted
+
+    for (uint32_t s = 0; s < n_blocks; ++s) {
+        const llama_seq_id seq_id = ubatch.seq_id[s*n_tok][0];
+
+        uint32_t head_cur = kv_lane_head(cells, seq_id, n_seq_max, n_tok, cont);
+
+        std::vector<uint32_t> idxs;
+        idxs.reserve(n_tok);
+
+        uint32_t n_tested = 0;
+
+        const uint32_t n_test = cont ? n_tok : 1;
+
+        while (true) {
+            if (head_cur + n_test > cells.size()) {
+                n_tested += cells.size() - head_cur;
+                head_cur = 0;
+                continue;
+            }
+
+            for (uint32_t i = 0; i < n_test; i++) {
+                const auto idx = head_cur;
+
+                head_cur++;
+                n_tested++;
+
+                const bool can_use = cells.is_empty(idx) && !std::binary_search(taken.begin(), taken.end(), idx);
+
+                if (can_use) {
+                    idxs.push_back(idx);
+                } else if (cont) {
+                    break;
+                }
+            }
+
+            if (idxs.size() == n_tok) {
+                break;
+            }
+
+            if (cont) {
+                idxs.clear();
+            }
+
+            if (n_tested >= cells.size()) {
+                return { };
+            }
+        }
+
+        for (const auto idx : idxs) {
+            res.idxs[0].push_back(idx);
+            taken.insert(std::upper_bound(taken.begin(), taken.end(), idx), idx);
+        }
+    }
 
     return res;
 }
@@ -1426,6 +1542,40 @@ llama_kv_cache::kv_range llama_kv_cache::get_kv_range(const slot_info & sinfo, c
     const uint32_t n      = std::min(hi_pad,       (uint32_t) GGML_PAD(hi_pad - lo, n_pad_cur));
 
     return { hi_pad - n, n };
+}
+
+// [TAG_SHARED_PASS]
+std::vector<llama_kv_cache::kv_range> llama_kv_cache::get_kv_ranges(const slot_info & sinfo, const llama_ubatch & ubatch) const {
+    const uint32_t n_blocks = get_n_seq_blocks(ubatch);
+
+    if (n_blocks < 2) {
+        return { get_kv_range(sinfo, ubatch) };
+    }
+
+    const auto & cells = v_cells[0];
+
+    const uint32_t n_tok     = ubatch.n_tokens / n_blocks;
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+    std::vector<kv_range> res;
+    res.reserve(n_blocks);
+
+    for (uint32_t s = 0; s < n_blocks; ++s) {
+        const llama_seq_id seq_id = ubatch.seq_id[s*n_tok][0];
+
+        const uint32_t lo = cells.seq_idx_min(seq_id);
+        const uint32_t hi = cells.seq_idx_max_p1(seq_id);
+
+        GGML_ASSERT(hi > lo && "a sequence of the ubatch has no cells");
+
+        // same padding as get_kv_range()
+        const uint32_t hi_pad = std::min(cells.size(), (uint32_t) GGML_PAD(hi, n_pad_cur));
+        const uint32_t n      = std::min(hi_pad,       (uint32_t) GGML_PAD(hi_pad - lo, n_pad_cur));
+
+        res.push_back({ hi_pad - n, n });
+    }
+
+    return res;
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t kv_off) const {
@@ -1705,6 +1855,9 @@ struct args_set_input_kq_mask {
 
     // [TAG_KV_LANES] the mask covers the cells [kv_off, kv_off + n_kv)
     uint32_t kv_off;
+
+    // [TAG_SHARED_PASS] the mask covers the tokens from i_tok0 on, row r of it is token i_tok0 + r
+    uint32_t i_tok0;
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -1743,7 +1896,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
 
         for (uint32_t ii = 0; ii < n_tps; ++ii) {
-            const uint32_t i = s*n_tps + ii;
+            const uint32_t i = args.i_tok0 + s*n_tps + ii;
 
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
@@ -1756,7 +1909,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
             const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
 
-            const uint64_t idst = n_kv*i;
+            const uint64_t idst = n_kv*(i - args.i_tok0);
 
             // for tokens of the same sequence, the mask is mostly the same, so we can reuse it
             // the only cells that could change are the ones that are with similar positions as the
@@ -1772,7 +1925,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 if (seq_srct.find(seq_id) != seq_srct.end()) {
                     const uint32_t srct = seq_srct[seq_id];
 
-                    const uint64_t idst_prev = n_kv*srct;
+                    const uint64_t idst_prev = n_kv*(srct - args.i_tok0);
 
                     std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
 
@@ -1902,8 +2055,11 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_off) const {
-    const uint32_t n_tokens = ubatch->n_tokens;
+void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_off,
+        uint32_t i_tok0, uint32_t n_tok) const {
+    // [TAG_SHARED_PASS] a window of the ubatch, or all of it
+    GGML_ASSERT(i_tok0 + n_tok <= ubatch->n_tokens);
+    const uint32_t n_tokens = n_tok > 0 ? n_tok : ubatch->n_tokens;
 
     llama_host_write(dst);
 
@@ -1934,6 +2090,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
         /*.kv_off           =*/ kv_off,
+        /*.i_tok0           =*/ n_tok > 0 ? i_tok0 : 0,
     };
 
     if (dst->type == GGML_TYPE_F16) {
@@ -3010,11 +3167,11 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
 
-    // [TAG_KV_LANES]
-    const auto range = kv->get_kv_range(sinfos[i_cur], ubatches[i_cur]);
+    // [TAG_KV_LANES] [TAG_SHARED_PASS]
+    ranges = kv->get_kv_ranges(sinfos[i_cur], ubatches[i_cur]);
 
-    n_kv   = range.n;
-    kv_off = range.off;
+    n_kv   = ranges[0].n;
+    kv_off = ranges[0].off;
 
     return true;
 }
@@ -3035,6 +3192,33 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
 
 uint32_t llama_kv_cache_context::get_kv_off() const {
     return kv_off;
+}
+
+// [TAG_SHARED_PASS]
+uint32_t llama_kv_cache_context::get_n_ranges() const {
+    return ranges.size() > 1 ? (uint32_t) ranges.size() : 1;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv(uint32_t s) const {
+    return ranges.size() > 1 ? ranges.at(s).n : (uint32_t) n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_kv_off(uint32_t s) const {
+    return ranges.size() > 1 ? ranges.at(s).off : kv_off;
+}
+
+ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, uint32_t s) const {
+    return kv->get_k(ctx, il, get_n_kv(s), sinfos[i_cur], get_kv_off(s));
+}
+
+ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, uint32_t s) const {
+    return kv->get_v(ctx, il, get_n_kv(s), sinfos[i_cur], get_kv_off(s));
+}
+
+void llama_kv_cache_context::set_input_kq_mask_seq(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t s) const {
+    const uint32_t n_tok = ubatch->n_tokens / get_n_ranges();
+
+    kv->set_input_kq_mask(dst, ubatch, causal_attn, get_kv_off(s), s*n_tok, n_tok);
 }
 
 ggml_type llama_kv_cache_context::type_k() const {
