@@ -7,6 +7,11 @@
 // TODO optimize kernel parameters for FP16 NVIDIA (P100)
 // TODO optimize kernel parameters for head sizes 40, 72, 80, 96, 112
 
+// [TAG_FATTN_GQA6] which set of kernel configurations the 6-columns-per-query path uses, see the RDNA table
+#ifndef GGML_HIP_FA_GQA6_VARIANT
+#define GGML_HIP_FA_GQA6_VARIANT 1
+#endif // GGML_HIP_FA_GQA6_VARIANT
+
 // The ROCm compiler cannot handle templating in __launch_bounds__.
 // As a workaround, define a macro to package the kernel parameters as uint32_t:
 #define GGML_CUDA_FATTN_TILE_CONFIG_CASE(DKQ_, DV_, ncols_, nthreads, occupancy, nbatch_fa, nbatch_K) \
@@ -295,6 +300,24 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 128, 6,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 5,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 3,  64, 128)
+
+    // [TAG_FATTN_GQA6] a GQA ratio of 6 in one block per KV head: 6 columns per query, 1 to 5 queries.
+    // The number of columns must be a multiple of the number of warps (columns per warp = ncols/nwarps).
+#if GGML_HIP_FA_GQA6_VARIANT == 1
+    // 6 columns per warp: one K row and one V row read from shared memory serve six dot products
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6,  96, 6,  32, 256) // 3 warps, 2 columns each
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12,  64, 8,  32, 256) // 2 warps
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 18,  96, 6,  32, 256) // 3 warps
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 128, 6,  32, 256) // 4 warps
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 30, 160, 5,  32, 256) // 5 warps
+#else
+    // 2 or 4 columns per warp, as the tuned configurations for 8, 16 and 32 columns have
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6,  96, 6,  32, 256) //  3 warps, 2 columns each
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12, 192, 6,  32, 256) //  6 warps, 2
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 18, 288, 4,  32, 256) //  9 warps, 2
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 192, 5,  32, 256) //  6 warps, 4
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 30, 480, 3,  32, 256) // 15 warps, 2
+#endif // GGML_HIP_FA_GQA6_VARIANT == 1
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 32, 256, 2, 128,  64)
 
@@ -684,6 +707,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     constexpr int KQ_cs = cpw < 1*cpy_ne ? cpw : 1*cpy_ne;
 #endif // FAST_FP16_AVAILABLE
     static_assert(cpw % KQ_cs == 0, "bad KQ_cs");
+    // [TAG_FATTN_GQA6] a chunk of 3, 5 or 6 KQ values is not one register copy: it is moved in pieces of 2 or 4 bytes
+    constexpr int KQ_cpy_nb = KQ_cs*sizeof(T_KQ);
+    constexpr int KQ_cpy_al = (KQ_cpy_nb & (KQ_cpy_nb - 1)) == 0 ? 0 : (KQ_cpy_nb % 4 == 0 ? 4 : 2);
     const int k_VKQ_sup = k_VKQ_max - k_VKQ_0; // k supremum, only smaller k values have valid KV data
 
     float KQ_max_new[cpw];
@@ -795,7 +821,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         for (int i0 = 0; i0 < nbatch_fa; i0 += np*warp_size) {
             const int i = i0 + (threadIdx.y % np)*warp_size + threadIdx.x;
 
-            ggml_cuda_memcpy_1<sizeof(tmp[0])>(
+            static_assert(sizeof(tmp[0]) == KQ_cpy_nb, "bad KQ chunk");
+            ggml_cuda_memcpy_1<KQ_cpy_nb, KQ_cpy_al>(
                 KQ + (jc0/KQ_cs + (threadIdx.y / np)*(cpw/KQ_cs))*(nbatch_fa*KQ_cs) + i*KQ_cs,
                 tmp[i0/(np*warp_size)]);
         }
@@ -839,7 +866,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
                 const int jc_KQ = jc_VKQ_0/KQ_cs + (threadIdx.y / np)*(cpw/KQ_cs);
 
                 __align__(16) half tmp[KQ_cs];
-                ggml_cuda_memcpy_1<KQ_cs*sizeof(half)>(
+                ggml_cuda_memcpy_1<KQ_cpy_nb, KQ_cpy_al>(
                     &tmp, KQ + jc_KQ*(nbatch_fa*KQ_cs) + (k0 + k1 + threadIdx.y % np)*KQ_cs);
 #pragma unroll
                 for (int jc_VKQ_1 = 0; jc_VKQ_1 < KQ_cs; ++jc_VKQ_1) {
@@ -870,7 +897,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; jc_VKQ_0 += KQ_cs) {
                 const int jc_KQ = jc_VKQ_0/KQ_cs + (threadIdx.y / np)*(cpw/KQ_cs);
 
-                ggml_cuda_memcpy_1<KQ_cs*sizeof(float)>(
+                ggml_cuda_memcpy_1<KQ_cpy_nb, KQ_cpy_al>(
                     &KQ_k[jc_VKQ_0], KQ + jc_KQ*(nbatch_fa*KQ_cs) + (k0 + k1 + threadIdx.y % np)*KQ_cs);
             }
 
@@ -1353,6 +1380,55 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     GGML_ABORT("fatal error");
 }
 
+#if defined(GGML_USE_HIP) && defined(RDNA)
+// [TAG_FATTN_GQA6] Qwen3.5/3.8-27B: 24 query heads on 4 KV heads, head size 256. The generic path below treats a GQA
+// ratio of 6 as three groups of two heads, so every K/V tile is loaded (and, for a q4_0 cache, expanded) three times,
+// and a batch of 5 queries is padded to 8 columns. This path gives each KV head one block with all 6 of its query
+// heads and exactly as many queries as the batch has: 6, 12, 18, 24 or 30 columns for 1 to 5 queries (a draft step,
+// an MTP verify batch). Larger batches keep the generic path, where the K/V loads are a small share of the work.
+// GGML_HIP_FA_GQA6: 0 = off (the default until it is verified on the device), 1 = on.
+static inline int ggml_cuda_fattn_tile_gqa6_mode() {
+    static const int mode = [] {
+        const char * env = getenv("GGML_HIP_FA_GQA6");
+        return env ? atoi(env) : 0;
+    }();
+    return mode;
+}
+
+template <int DKQ, int DV, int ncols1, bool use_logit_softcap>
+static void launch_fattn_tile_gqa6_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const bool kv_q4_0) {
+    constexpr int    ncols2        = 6;
+    constexpr size_t nbytes_shared = 0;
+
+    const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int warp_size = 32;
+    const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols1*ncols2, cc) / warp_size;
+    const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2, cc);
+    GGML_ASSERT(nwarps > 0 && (ncols1*ncols2) % nwarps == 0);
+
+    fattn_kernel_t fattn_kernel = ggml_cuda_fattn_tile_get_kernel<DKQ, DV, ncols1, ncols2, use_logit_softcap>(kv_q4_0);
+    launch_fattn<DV, ncols1, ncols2>
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, !kv_q4_0, !kv_q4_0, false, false, warp_size);
+}
+
+// returns false if the batch is not one this path handles
+template <int DKQ, int DV, bool use_logit_softcap>
+static bool launch_fattn_tile_gqa6(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+
+    const bool kv_q4_0 = ggml_cuda_fattn_tile_reads_q4_0(dst);
+
+    switch (Q->ne[1]) {
+        case 1: launch_fattn_tile_gqa6_case<DKQ, DV, 1, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
+        case 2: launch_fattn_tile_gqa6_case<DKQ, DV, 2, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
+        case 3: launch_fattn_tile_gqa6_case<DKQ, DV, 3, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
+        case 4: launch_fattn_tile_gqa6_case<DKQ, DV, 4, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
+        case 5: launch_fattn_tile_gqa6_case<DKQ, DV, 5, use_logit_softcap>(ctx, dst, kv_q4_0); return true;
+        default: return false;
+    }
+}
+#endif // defined(GGML_USE_HIP) && defined(RDNA)
+
 template <int DKQ, int DV, bool use_logit_softcap>
 static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
@@ -1416,6 +1492,16 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     }
 
     if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
+#if defined(GGML_USE_HIP) && defined(RDNA)
+        // [TAG_FATTN_GQA6] six query heads per KV head, 1 to 5 queries: one block per KV head
+        if constexpr (DKQ == 256 && DV == 256 && !use_logit_softcap) {
+            if (use_gqa_opt && gqa_ratio == 6 && ggml_cuda_fattn_tile_gqa6_mode() > 0 &&
+                    launch_fattn_tile_gqa6<DKQ, DV, use_logit_softcap>(ctx, dst)) {
+                return;
+            }
+        }
+#endif // defined(GGML_USE_HIP) && defined(RDNA)
+
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
             return;

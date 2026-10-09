@@ -11602,6 +11602,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
     // mixed quant and Q1_0 test cases
+    // ROCmFPX [TAG_FATTN_GQA6]: a GQA ratio of 6 with head size 256 (Qwen3.8-27B), batches of 1 to 5 queries on q4_0 and
+    // f16 caches. With GGML_HIP_FA_GQA6=1 the HIP tile kernel gives each KV head one block with all six query heads.
+    for (ggml_type type_KV : {GGML_TYPE_Q4_0, GGML_TYPE_F16}) {
+        for (int64_t kv : {512, 2048, 4352}) {
+            for (int64_t nb : {1, 2, 3, 4, 5}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
+    }
+
     // ROCmFPX [TAG_FATTN_TILE_Q4_0]: decode-sized batches on a q4_0 cache with head size 256 and grouped queries;
     // on HIP the tile kernel expands the q4_0 K/V tiles itself. Other backends take their usual path.
     for (int64_t nr2 : {2, 4, 6, 8}) {
@@ -11923,7 +11933,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // ROCmFPX: decode-sized attention at depth: 1 and 4 queries (a draft step, a verify batch) over 16k and 41k cells,
     // head 256, 4 KV heads with GQA 6, the production q4_0 KV cache against f16
     for (int64_t kv : {16384, 40960}) {
-        for (int64_t nb : {1, 4}) {
+        for (int64_t nb : {1, 2, 3, 4, 5, 8}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
         }
