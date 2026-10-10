@@ -2,49 +2,31 @@
 
 # Qwen3.8-27B for agents on a Radeon RX 7900 XT / XTX
 
-A `llama-server` runtime for **Qwen3.8-27B with 80k context on a 20 GB
-RX 7900 XT** (more on the 24 GB XTX), built for **agentic work**: long
-tool-calling sessions, several agents sharing one GPU, and clients that rewrite
-their own history. It is [ROCmFPX](#rocmfpx-llamacpp) (ROCm/HIP, ROCmFP4
-weights) plus a server-side prompt cache on SSD.
+A `llama-server` runtime for **Qwen3.8-27B on a 20 GB RX 7900 XT**, built
+for **agentic work**: long tool-calling sessions, several agents sharing one
+GPU, and clients that rewrite their own history. Two slots share a KV pool of
+80k to 104k tokens. It is a fork of [ROCmFPX](#rocmfpx-llamacpp) (ROCm/HIP
+backend, ROCmFP4 weights) that adds a prompt cache on SSD, slot ranges and a
+shared decode pass for several slots, a faster MTP draft and attention path,
+and a decision classifier on the same port. Everything is measured on the XT;
+the 24 GB XTX has room for a larger pool but was not tested.
 
-## What it does well
+## Highlights
 
-- **A 27B model with 80k context on a 20 GB card.** ROCmFP4 weights (~15 GB)
-  and a q4_0 KV cache: 18.9 GB at load.
+- **A 27B model with up to 104k tokens of context on a 20 GB card.** ROCmFP4
+  weights (~15 GB) and a q4_0 KV cache: at `-c 106496` 18.9 GB are resident
+  and 0.8 GB paged.
 - **Fast decode.** The model's own MTP head drafts four tokens ahead: 50 t/s
   on prose and 73 t/s on code, against 35 t/s without it.
-- **Switching conversations costs seconds, not minutes.** Qwen3.8 is a hybrid
-  (16 attention + 49 recurrent layers), and recurrent state cannot be rolled
-  back to an arbitrary prefix, so stock llama.cpp re-prefills a conversation
-  from scratch once another request has taken the slot. Here the conversation
-  is written to SSD together with its checkpoints and restored when it returns:
-
-  | situation | stock | this runtime, median (range) |
-  |---|---|---|
-  | return to a 40-53k-token conversation after another agent used the slot | 77-105 s | **2.9 s** (1.5-7.3) |
-  | new session with the same 12-24k system prompt + tools | 20-42 s | **0.7 s** (0.4-25) |
-  | prompt diverges from the cached one before its end, 25-34k | 45-62 s | 7.5 s (6.5-10) |
-  | first request after a server restart, 18-27k | 30-50 s | 4.2 s (1.0-10.9) |
-
-- **Two slots on one shared KV pool.** An orchestrator's chat turn no longer
-  waits behind a worker's long run. A request starts beside a running one only
-  when both keep 12k tokens of generation room, otherwise it queues; a
-  conversation that has to give up its cells is saved to SSD first, so nothing
-  is lost when the pool fills. More agents than slots is what the cache is for.
-- **An idle conversation costs the active one nothing.** Each slot keeps its
-  cells in its own range of the pool and attention runs over that range only.
-  Stock llama.cpp computes attention over every occupied cell of a shared
-  cache, so a 41k-token conversation resting in one slot cut the other slot's
-  decode from 48 to 31 t/s and its prefill from 611 to 369 t/s. Here both stay
-  at 48 and 608.
-- **Two busy slots share one pass.** When both slots decode at the same
-  moment their tokens go through the model together instead of taking turns:
-  67 t/s in total against 46, with one slot alone at 55. The logits are the
-  same, bit for bit, as with a pass per slot.
+- **Switching conversations costs seconds, not minutes.** A conversation is
+  written to SSD with its checkpoints and restored when it returns: 2.9 s for
+  40-53k tokens instead of a 77-105 s re-prefill. [More](#the-ssd-prompt-cache)
+- **Several agents on one GPU.** Two slots share one KV pool. An idle
+  conversation costs the active one nothing, and two busy slots decode at
+  67 t/s in total instead of 46. [More](#several-slots-on-one-gpu)
 - **Shared system prompts.** States are saved every 4096 tokens inside the
-  system prompt + tools block and at its end. Any conversation that starts with
-  the same tokens resumes from the deepest state it still shares.
+  system prompt + tools block; a conversation that starts with the same tokens
+  resumes from the deepest state it shares.
 - **Survives restarts.** Cache entries left by a previous run are adopted.
 - **Vision** through the f16 `mmproj`, including after a cache restore.
 - **A decision classifier on the same port**: typed yes/no, choice and score
@@ -56,75 +38,9 @@ Measured on one machine: RX 7900 XT 20 GB, Ryzen 9 7900, 32 GB RAM,
 Windows 11, ROCm 7.2 HIP SDK, one NVMe for models and cache. Nothing here has
 been measured on an XTX.
 
-## Quick start
-
-**1. Model.** `Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S` (~15 GB): ROCmFP4
-weights and the MTP head, with 61 sensitive tensors promoted to
-`Q6_0_ROCMFPX`, plus the f16 `mmproj` for vision. The
-[recipe and its tensor policy file](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
-are in this repository.
-
-**2. Build** (ROCm 7.2 clang, Ninja; about 3 minutes):
-
-```
-cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release ^
-  -DCMAKE_C_COMPILER="%HIP_PATH%bin\clang.exe" -DCMAKE_CXX_COMPILER="%HIP_PATH%bin\clang++.exe" ^
-  -DCMAKE_PREFIX_PATH="%HIP_PATH%" -DGGML_HIP=ON -DGPU_TARGETS=gfx1100 -DCMAKE_HIP_ARCHITECTURES=gfx1100 ^
-  -DGGML_HIP_GRAPHS=ON -DGGML_HIP_NO_VMM=ON -DGGML_HIP_FORCE_MMQ=ON -DGGML_CUDA_FA_ALL_QUANTS=ON ^
-  -DGGML_CUDA_GRAPHS=ON -DGGML_NATIVE=ON -DGGML_OPENMP=ON -DGGML_SCHED_MAX_COPIES=4 ^
-  -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF ^
-  -DLLAMA_BUILD_WEBUI=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
-cmake --build build-hip --target llama-server -j 12
-```
-
-**3. Run:**
-
-```
-set "PATH=%HIP_PATH%bin;%PATH%"
-set GGML_CUDA_NO_PINNED=1
-set LLAMA_MAX_QUEUED=3
-set ROCMFPX_DRAFT_VOCAB=16384
-set GGML_HIP_FA_GQA6=1
-
-llama-server -m Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S.gguf --mmproj mmproj-Qwen3.8-27B-f16.gguf ^
-  -dev ROCm0 -ngl 999 -fa on --jinja --load-mode dio --gpu-keepalive-ms 2000 ^
-  -c 81920 -np 2 --kv-unified --kv-unified-reserve 12288 --no-cache-idle-slots ^
-  -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -b 2048 -ub 1024 --no-mmproj-offload ^
-  --ctx-checkpoints 8 --checkpoint-min-step 2048 ^
-  --cache-ram 0 --cache-disk D:\llama-cache --cache-disk-limit 65536 --cache-disk-checkpoints 4 ^
-  --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.60 ^
-  --chat-template-kwargs "{\"reasoning_effort\":\"low\"}" ^
-  --reasoning-preserve --temp 1 --sleep-idle-seconds -1 ^
-  --alias qwen/qwen3.8-27b --host 0.0.0.0 --port 1234 --api-key-file api-keys.txt
-```
-
-The server speaks the usual OpenAI-compatible API on `/v1`.
-
-| setting | why |
-|---|---|
-| `-c 81920`, q4_0 KV | about what a 20 GB card holds; KV costs ~18 KB/token. Whatever does not fit, Windows silently pages to system RAM. We run `-c 106496` in production: 18.9 GB resident, 0.8 GB paged. |
-| `-np 2 --kv-unified --kv-unified-reserve 12288` | two slots share one pool instead of splitting it. The reserve admits a second request only while both can still generate 12k tokens, else it waits in the queue; idle slots are saved to the cache before their cells are taken. Without it a full pool fails both requests and wipes both contexts. Each slot's cells stay in its own range of the pool (with more slots, two per region), so attention covers the active conversation only. |
-| `--no-cache-idle-slots` | keeps the idle conversation resident; the default saves and clears it at every new task, which leaves one live conversation. |
-| shared pass (on by default) | slots that decode at the same moment go through the model in one pass: 67 t/s in total with both slots busy instead of 46, same logits. `--no-shared-pass` gives every slot its own pass again. |
-| `--no-mmproj-offload` | the 0.9 GB vision projector was the whole paged share at two slots. Images cost 7-12 s to the first token instead of 3-5 s. |
-| `-ub 1024` | prefill +6% at 17k and +11% at 41k over 256, for 0.3 GB more paged memory; 512 gives +4% and +8% for 0.1 GB. Decode does not change with it (55.7 against 56.0 t/s on identical text). |
-| MTP draft, `n-max 4` | +45% decode on prose, +112% on code, for 1.4 GB of VRAM and 3% of prefill speed. The draft head has its own KV cache; for prompt tokens only its K and V are computed, nothing else of the block is ever read. |
-| `ROCMFPX_DRAFT_VOCAB=16384` | a drafted token is scored against 16,384 candidate tokens instead of all 248,320: half fixed, half the main model's own top tokens at the previous position, per slot. 0.12 ms instead of 1.9 ms per drafted token; the main model still verifies each one against the full vocabulary. Decode +9% on a short context, +3 to 5% at 41k. A verbatim copy drafts slightly less (acceptance 0.99 to 0.96), ordinary text the same. |
-| `GGML_HIP_FA_GQA6=1` | attention for decode batches of 1 to 5 tokens: one GPU block per KV head with all six of its query heads, instead of three groups of two and a batch padded to 8. Decode +10 to 12% at 41k, +2 to 6% at 17k, nothing at a short context. Qwen3.5/3.8-27B on RDNA only (head size 256, 24 query heads on 4 KV heads). |
-| `--ctx-checkpoints 8` | kept in host RAM, ~200 MiB each. When the list is full, the one whose removal leaves the smallest gap is dropped; the one at the first user message never is. |
-| `--load-mode dio` | the default memory-mapped load keeps the 15 GB model file in system RAM. |
-| `--gpu-keepalive-ms 2000` | an idle card on a nearly full VRAM budget loses its resident memory and the next request crawls. |
-| `--reasoning-preserve` | with a client that does not echo thinking, every past assistant turn renders as an empty think block (~4 tokens). Without it the template renders the previous turn differently once a new user message arrives, so a tool-using turn was re-prefilled (median 5k tokens) on every exchange. |
-| `GGML_CUDA_NO_PINNED=1` | pinned host memory makes more of the model page out, for no speed gain. |
-| `--temp 1` | Qwen3.8 degrades under greedy decoding. |
-
 ## Speed
 
-Measured on 9 and 10 October 2026 at the production shape (`-c 106496`, two
-slots, `-ub 1024`, vision projector on the CPU, draft vocabulary 16384).
-
-Nine 450-token runs per row at temperature 1, on the production server while
-it was idle:
+Decode on the production server, 450-token answers at temperature 1:
 
 | decode t/s | median | peak | lowest | draft accepted |
 |---|---:|---:|---:|---:|
@@ -132,26 +48,53 @@ it was idle:
 | code | 73.4 | 81.8 | 62.0 | 0.73 |
 | without MTP, prose or code | 34.6 | 34.7 | | |
 
-Code decodes faster than prose because more of the draft is accepted. On the
-morning of 9 October, before the decode changes listed below, the same prompts
-gave 47.3 for prose and 64.1 for code; the row without MTP is from that
-morning. The table predates the last change (attention at depth), which does
-nothing at this depth: 51.0 and 74.3 with it on a test server.
+<sub>Nine runs per row on 9 October 2026 while the server was idle, at the
+production shape: `-c 106496`, two slots, `-ub 1024`, vision projector on the
+CPU, draft vocabulary 16384. Code decodes faster because more of the draft is
+accepted. The row without MTP is from that morning, before the decode changes
+listed further down; the same prompts then gave 47.3 for prose and 64.1 for
+code. The table predates the last change (attention at depth), which does
+nothing at this depth: 51.0 and 74.3 with it on a test server.</sub>
 
-At temperature 0 on fixed prompts, which is what the step tables below use:
+Deep in a conversation, and on cold prompts:
 
-| decode t/s | |
-|---|---:|
-| the 260-token answer to a cold 17k prompt | 54.7 |
-| at 41k depth (three 300-token turns) | 55.9 |
-| verbatim copy of a passage at 41k | 82.2 |
-
-| cold prompt | 17k | 41k |
+| | 17k | 41k |
 |---|---:|---:|
-| prefill t/s, average over the prompt | 679 | 621 |
+| decode t/s at that depth | 54.7 | 55.9 |
+| decode t/s, verbatim copy of a passage | | 82.2 |
+| prefill t/s, cold prompt, average over the prompt | 679 | 621 |
 | the same without the MTP draft | 701 | 640 |
 
-What moved prefill that day, same two prompts:
+<sub>Fixed prompts at temperature 0 on a test server, 10 October 2026: the
+260-token answer to a cold 17k prompt, three 300-token turns at 41k.</sub>
+
+Real agent traffic by context depth:
+
+| context depth | decode median | decode peak | prefill median | prefill peak |
+|---|---:|---:|---:|---:|
+| under 8k | 63.5 | 70.3 | 333 | 451 |
+| 8-20k | 47.1 | 67.0 | 536 | 608 |
+| 20-40k | 43.4 | 66.3 | 495 | 571 |
+| 40-60k | 41.5 | 51.9 | 414 | 465 |
+| 60-80k | 33.3 | 40.2 | 420 | 436 |
+| all | 43.7 | 70.3 | 500 | 608 |
+
+<sub>Production, 2-6 October 2026: 718 agent requests at `-c 106496`, before
+the changes listed below; requests generating 200+ tokens (decode) or
+evaluating 1,500+ (prefill). The slope is attention over the growing KV cache;
+the recurrent layers cost the same at any depth. The first and last rows rest
+on 3-14 requests each. The cache table in
+[The SSD prompt cache](#the-ssd-prompt-cache) comes from the same log.</sub>
+
+Both slots busy: 35 t/s each, 67 t/s in total. See
+[Several slots on one GPU](#several-slots-on-one-gpu).
+
+### What moved the numbers
+
+The step tables use fixed prompts at temperature 0, each step on top of the
+one above.
+
+What moved prefill on 9 October, same two cold prompts:
 
 | cold prefill t/s | 17k | 41k |
 |---|---:|---:|
@@ -226,63 +169,75 @@ the same shapes and stock Q4_0 47-54, so the kernel is within a quarter of
 what this card does at all. The rest is attention (17.6 us per token and layer
 at 16k of history, growing with depth) and 3% for the recurrent layers.
 
-Production traffic, 2-6 October 2026 (718 agent requests at `-c 106496`,
-before the changes above), by context depth; requests generating 200+ tokens
-(decode) or evaluating 1,500+ (prefill). The cache table at the top comes from
-the same log, with "stock" being a cold prefill at these speeds.
+## Quick start
 
-| context depth | decode median | decode peak | prefill median | prefill peak |
-|---|---:|---:|---:|---:|
-| under 8k | 63.5 | 70.3 | 333 | 451 |
-| 8-20k | 47.1 | 67.0 | 536 | 608 |
-| 20-40k | 43.4 | 66.3 | 495 | 571 |
-| 40-60k | 41.5 | 51.9 | 414 | 465 |
-| 60-80k | 33.3 | 40.2 | 420 | 436 |
-| all | 43.7 | 70.3 | 500 | 608 |
+**1. Model.** `Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S` (~15 GB): ROCmFP4
+weights and the MTP head, with 61 sensitive tensors promoted to
+`Q6_0_ROCMFPX`, plus the f16 `mmproj` for vision. The
+[recipe and its tensor policy file](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
+are in this repository.
 
-The slope is attention over the growing KV cache; the recurrent layers cost
-the same at any depth. The first and last rows rest on 3-14 requests each.
+**2. Build** (ROCm 7.2 clang, Ninja; about 3 minutes):
 
-Two slots, one of them idle with a 41k-token conversation in it. Stock
-llama.cpp computes attention over every occupied cell of the shared cache; here
-each slot attends to its own range (measured at `-ub 256`, before the decode
-changes above):
+```
+cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+  -DCMAKE_C_COMPILER="%HIP_PATH%bin\clang.exe" -DCMAKE_CXX_COMPILER="%HIP_PATH%bin\clang++.exe" ^
+  -DCMAKE_PREFIX_PATH="%HIP_PATH%" -DGGML_HIP=ON -DGPU_TARGETS=gfx1100 -DCMAKE_HIP_ARCHITECTURES=gfx1100 ^
+  -DGGML_HIP_GRAPHS=ON -DGGML_HIP_NO_VMM=ON -DGGML_HIP_FORCE_MMQ=ON -DGGML_CUDA_FA_ALL_QUANTS=ON ^
+  -DGGML_CUDA_GRAPHS=ON -DGGML_NATIVE=ON -DGGML_OPENMP=ON -DGGML_SCHED_MAX_COPIES=4 ^
+  -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF ^
+  -DLLAMA_BUILD_WEBUI=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
+cmake --build build-hip --target llama-server -j 12
+```
 
-| the active slot | other slot empty | stock, other slot holds 41k | this runtime, other slot holds 41k |
-|---|---:|---:|---:|
-| shallow decode t/s | 48 | 31 | 49 |
-| cold 17k prefill t/s | 611 | 369 | 608 |
-| decode t/s at 17k depth | 50 | 36 | 51 |
+**3. Run:**
 
-Two slots working at the same moment. Slots that decode at the same moment
-share the pass over the model: their tokens form one batch of up to 8, the
-weights are read once, and attention still runs per slot over its own range.
-The draft heads draft in step while both are busy (at most 3 tokens ahead
-instead of 4), so that both slots bring batches of the same length. With a
-pass per slot a loop with both decoding took 84 ms, exactly two single-slot
-loops; shared it takes 44 ms.
+```
+set "PATH=%HIP_PATH%bin;%PATH%"
+set GGML_CUDA_NO_PINNED=1
+set LLAMA_MAX_QUEUED=3
+set ROCMFPX_DRAFT_VOCAB=16384
+set GGML_HIP_FA_GQA6=1
 
-| both slots busy | a pass per slot (`--no-shared-pass`) | shared pass |
-|---|---:|---:|
-| both decoding: each slot, t/s | 24.9 and 23.9 | 35.1 and 34.6 |
-| both decoding: total t/s | 46.0 | 66.7 |
-| one slot alone, t/s | 54.0 | 54.8 |
-| one prefills a cold 17k prompt: its prefill t/s | 672 | 668 |
-| ... and the other slot's decode t/s meanwhile | 10.1 | 10.3 |
+llama-server -m Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S.gguf --mmproj mmproj-Qwen3.8-27B-f16.gguf ^
+  -dev ROCm0 -ngl 999 -fa on --jinja --load-mode dio --gpu-keepalive-ms 2000 ^
+  -c 81920 -np 2 --kv-unified --kv-unified-reserve 12288 --no-cache-idle-slots ^
+  -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -b 2048 -ub 1024 --no-mmproj-offload ^
+  --ctx-checkpoints 8 --checkpoint-min-step 2048 ^
+  --cache-ram 0 --cache-disk D:\llama-cache --cache-disk-limit 65536 --cache-disk-checkpoints 4 ^
+  --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.60 ^
+  --chat-template-kwargs "{\"reasoning_effort\":\"low\"}" ^
+  --reasoning-preserve --temp 1 --sleep-idle-seconds -1 ^
+  --alias qwen/qwen3.8-27b --host 0.0.0.0 --port 1234 --api-key-file api-keys.txt
+```
 
-The logits of a shared pass are the same, bit for bit, as those of each slot
-decoded in a pass of its own (checked on the GPU for 1 to 4 tokens per slot,
-with and without rejected draft tokens; `tests/test-rocmfpx-seq-parity.cpp`
-is the CPU version of that check). A prefilling slot still takes passes of its
-own, which is why the slot beside a cold prefill waits. Both conversations
-stay warm.
+The server speaks the usual OpenAI-compatible API on `/v1`.
 
-The same conversation does not produce bit-identical logits in slot 0 and in
-slot 1: the second slot fills its range from the top of the pool downwards,
-attention sums its cells in another order, and the last bits differ. With a
-4-bit KV cache that grows to 0.1 to 0.3 in the log-probabilities of the ten
-most likely tokens, about what the tile and the vector attention kernel
-differ by on one and the same slot (0.08 to 0.16).
+Flags:
+
+| flag | why |
+|---|---|
+| `-c 81920`, `-ctk q4_0 -ctv q4_0` | about what a 20 GB card holds; KV costs ~18 KB/token. Whatever does not fit, Windows silently pages to system RAM. We run `-c 106496` in production: 18.9 GB resident, 0.8 GB paged. |
+| `-np 2 --kv-unified --kv-unified-reserve 12288` | two slots share one pool instead of splitting it. The reserve admits a second request only while both can still generate 12k tokens, else it waits in the queue. See [Several slots on one GPU](#several-slots-on-one-gpu). |
+| `--no-cache-idle-slots` | keeps the idle conversation resident; the default saves and clears it at every new task, which leaves one live conversation. |
+| `--no-mmproj-offload` | the 0.9 GB vision projector was the whole paged share at two slots. Images cost 7-12 s to the first token instead of 3-5 s. |
+| `-ub 1024` | prefill +6% at 17k and +11% at 41k over 256, for 0.3 GB more paged memory; 512 gives +4% and +8% for 0.1 GB. Decode does not change with it (55.7 against 56.0 t/s on identical text). |
+| `--spec-type draft-mtp --spec-draft-n-max 4` | +45% decode on prose, +112% on code, for 1.4 GB of VRAM and 3% of prefill speed. The draft head has its own KV cache; for prompt tokens only its K and V are computed, nothing else of the block is ever read. |
+| `--ctx-checkpoints 8` | kept in host RAM, ~200 MiB each. When the list is full, the one whose removal leaves the smallest gap is dropped; the one at the first user message never is. |
+| `--cache-disk` | conversations and their checkpoints are kept on SSD. See [The SSD prompt cache](#the-ssd-prompt-cache). |
+| `--load-mode dio` | the default memory-mapped load keeps the 15 GB model file in system RAM. |
+| `--gpu-keepalive-ms 2000` | an idle card on a nearly full VRAM budget loses its resident memory and the next request crawls. |
+| `--reasoning-preserve` | with a client that does not echo thinking, every past assistant turn renders as an empty think block (~4 tokens). Without it the template renders the previous turn differently once a new user message arrives, so a tool-using turn was re-prefilled (median 5k tokens) on every exchange. |
+| `--temp 1` | Qwen3.8 degrades under greedy decoding. |
+
+Environment variables:
+
+| variable | why |
+|---|---|
+| `GGML_CUDA_NO_PINNED=1` | pinned host memory makes more of the model page out, for no speed gain. |
+| `LLAMA_MAX_QUEUED=3` | a request is rejected once three are already waiting, so a client can fall back to another server instead of queueing. |
+| `ROCMFPX_DRAFT_VOCAB=16384` | a drafted token is scored against 16,384 candidate tokens instead of all 248,320: half fixed, half the main model's own top tokens at the previous position, per slot. 0.12 ms instead of 1.9 ms per drafted token; the main model still verifies each one against the full vocabulary. Decode +9% on a short context, +3 to 5% at 41k. A verbatim copy drafts slightly less (acceptance 0.99 to 0.96), ordinary text the same. |
+| `GGML_HIP_FA_GQA6=1` | attention for decode batches of 1 to 5 tokens: one GPU block per KV head with all six of its query heads, instead of three groups of two and a batch padded to 8. Decode +10 to 12% at 41k, +2 to 6% at 17k, nothing at a short context. Qwen3.5/3.8-27B on RDNA only (head size 256, 24 query heads on 4 KV heads). |
 
 ## Other cards
 
@@ -312,6 +267,22 @@ the stock behaviour.
   other cards.
 
 ## The SSD prompt cache
+
+Qwen3.8 is a hybrid (16 attention + 49 recurrent layers), and recurrent state
+cannot be rolled back to an arbitrary prefix, so stock llama.cpp re-prefills a
+conversation from scratch once another request has taken its slot. Here the
+conversation is written to SSD together with its checkpoints and restored when
+it returns:
+
+| situation | stock | this runtime, median (range) |
+|---|---|---|
+| return to a 40-53k-token conversation after another agent used the slot | 77-105 s | **2.9 s** (1.5-7.3) |
+| new session with the same 12-24k system prompt + tools | 20-42 s | **0.7 s** (0.4-25) |
+| prompt diverges from the cached one before its end, 25-34k | 45-62 s | 7.5 s (6.5-10) |
+| first request after a server restart, 18-27k | 30-50 s | 4.2 s (1.0-10.9) |
+
+<sub>Production log of 2-6 October 2026; "stock" is a cold prefill at the
+speeds of that log.</sub>
 
 Off unless `--cache-disk` is given. Everything else has a working default.
 
@@ -344,6 +315,64 @@ with that model and `--classifier-config`, or run it as a child of a router
 (`--models-preset`) next to the big model: one port, one API key, both models.
 On the CPU (`-dev none -ngl 0`) StartLux-Decision-2B BF16 answers a yes/no
 question in 0.4 s. Details: [docs/classifier.md](docs/classifier.md).
+
+## Several slots on one GPU
+
+`-np 2 --kv-unified` gives two agents a slot each on one shared KV pool, so an
+orchestrator's chat turn does not wait behind a worker's long run. More agents
+than slots is what the [SSD prompt cache](#the-ssd-prompt-cache) is for.
+
+- **Admission.** With `--kv-unified-reserve 12288` a request starts beside a
+  running one only while both keep 12k tokens of generation room, otherwise it
+  queues. A conversation that has to give up its cells is saved to SSD first.
+  Without the reserve a full pool fails both requests and wipes both contexts.
+- **Slot ranges.** Each slot keeps its cells in its own range of the pool (with
+  more than two slots, two per region) and attention runs over that range
+  only, so an idle conversation costs the active one nothing.
+- **Shared pass.** Slots that decode at the same moment go through the model
+  in one pass. On by default; `--no-shared-pass` gives every slot its own pass
+  again.
+
+One slot idle with a 41k-token conversation in it. Stock llama.cpp computes
+attention over every occupied cell of the shared cache:
+
+| the active slot | other slot empty | stock, other slot holds 41k | this runtime, other slot holds 41k |
+|---|---:|---:|---:|
+| shallow decode t/s | 48 | 31 | 49 |
+| cold 17k prefill t/s | 611 | 369 | 608 |
+| decode t/s at 17k depth | 50 | 36 | 51 |
+
+<sub>Measured at `-ub 256` on 9 October 2026, before the decode changes in
+[Speed](#speed).</sub>
+
+Both slots busy. Slots that decode at the same moment share the pass over the
+model: their tokens form one batch of up to 8, the weights are read once, and
+attention still runs per slot over its own range. The draft heads draft in
+step while both are busy (at most 3 tokens ahead instead of 4), so that both
+slots bring batches of the same length. With a pass per slot a loop with both
+decoding took 84 ms, exactly two single-slot loops; shared it takes 44 ms.
+
+| both slots busy | a pass per slot (`--no-shared-pass`) | shared pass |
+|---|---:|---:|
+| both decoding: each slot, t/s | 24.9 and 23.9 | 35.1 and 34.6 |
+| both decoding: total t/s | 46.0 | 66.7 |
+| one slot alone, t/s | 54.0 | 54.8 |
+| one prefills a cold 17k prompt: its prefill t/s | 672 | 668 |
+| ... and the other slot's decode t/s meanwhile | 10.1 | 10.3 |
+
+The logits of a shared pass are the same, bit for bit, as those of each slot
+decoded in a pass of its own (checked on the GPU for 1 to 4 tokens per slot,
+with and without rejected draft tokens; `tests/test-rocmfpx-seq-parity.cpp`
+is the CPU version of that check). A prefilling slot still takes passes of its
+own, which is why the slot beside a cold prefill waits. Both conversations
+stay warm.
+
+The same conversation does not produce bit-identical logits in slot 0 and in
+slot 1: the second slot fills its range from the top of the pool downwards,
+attention sums its cells in another order, and the last bits differ. With a
+4-bit KV cache that grows to 0.1 to 0.3 in the log-probabilities of the ten
+most likely tokens, about what the tile and the vector attention kernel
+differ by on one and the same slot (0.08 to 0.16).
 
 ---
 
