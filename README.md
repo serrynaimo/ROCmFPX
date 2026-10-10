@@ -9,6 +9,9 @@ GPU, ideal for Hermes.
 
 ## Highlights
 
+- **Faster than stock llama.cpp on the same card.** A two-agent session takes
+  125 s here, 168 s on stock llama.cpp with its MTP draft and 17.7 min without
+  it; decode is about twice as fast. [Numbers](#speed)
 - **A 27B model with up to 100k tokens of context on a 20 GB card.** ROCmFP4
   weights (~15 GB) and a q4_0 KV cache: at `-c 106496` 18.9 GB are resident
   and 0.8 GB paged.
@@ -38,6 +41,23 @@ Windows 11, ROCm 7.2 HIP SDK, one NVMe for models and cache. Nothing here has
 been measured on an XTX.
 
 ## Speed
+
+Against stock llama.cpp on the same card: one scripted two-agent session with
+identical prompts (14 requests; an orchestrator grows from 4k to 41k tokens, a
+10k-token worker is called twice in between):
+
+| | stock llama.cpp | stock + MTP draft | this runtime |
+|---|---:|---:|---:|
+| **the session, wall-clock** | **1,065 s** | **168 s** | **125 s** |
+| prefill t/s, cold 4k prompt | 174 | 636 | 650 |
+| prefill t/s, 4.3k new tokens at 17k depth | 67 | 592 | 622 |
+| prefill t/s, 4.0k new tokens at 41k depth | 32 | 458 | 503 |
+| decode t/s at 4k depth | 32.3 | 31.5 | 59.1 |
+| decode t/s at 17k depth | 17.8 | 30.9 | 56.1 |
+| decode t/s at 41k depth | 10.6 | 24.3 | 53.7 |
+
+<sub>10 October 2026. Stock is LM Studio's ROCm llama.cpp runtime 2.55.0 with
+`Qwen3.8-27B-Q4_K_M`, flash attention, a q4_0 KV cache and two sessions.</sub>
 
 Decode on the production server, 450-token answers at temperature 1:
 
