@@ -10,8 +10,7 @@
 <text x="56" y="74" fill="#F4F4F5" font-size="38" font-weight="800" letter-spacing="-0.5">Qwen3.8-27B on a Radeon RX 7900 XT</text>
 <text x="56" y="110" fill="#9A9FA8" font-size="19">Agentic session with identical prompts: this runtime against LM Studio (llama.cpp + MTP)</text>
 <rect x="56" y="136" width="26" height="14" rx="3" fill="url(#red)" filter="url(#glow)"/><text x="92" y="149" fill="#F4F4F5" font-size="16" font-weight="600">this runtime</text>
-<rect x="216" y="136" width="26" height="14" rx="3" fill="#A3161C"/><text x="252" y="149" fill="#F4F4F5" font-size="16">this runtime + n-gram drafting</text>
-<rect x="496" y="136" width="26" height="14" rx="3" fill="#5B6068"/><text x="532" y="149" fill="#9A9FA8" font-size="16">LM Studio (llama.cpp + MTP)</text>
+<rect x="216" y="136" width="26" height="14" rx="3" fill="#5B6068"/><text x="252" y="149" fill="#9A9FA8" font-size="16">LM Studio (llama.cpp + MTP)</text>
 <rect x="40" y="186" width="1120" height="110" rx="14" fill="#141417" stroke="#26262B"/>
 <text x="64" y="217" fill="#ED1C24" font-size="17" font-weight="800" letter-spacing="2">AGENTIC SESSION</text>
 <text x="276" y="217" fill="#9A9FA8" font-size="14">wall-clock, lower is better</text>
@@ -65,12 +64,9 @@
 <text x="1136" y="773" text-anchor="end" fill="#F4F4F5" font-size="24" font-weight="800">+10%</text>
 <rect x="40" y="820" width="1120" height="110" rx="14" fill="#141417" stroke="#26262B"/>
 <text x="64" y="851" fill="#ED1C24" font-size="17" font-weight="800" letter-spacing="2">CODE EDITS</text>
-<text x="210" y="851" fill="#9A9FA8" font-size="14">decode t/s when the answer copies the prompt, higher is better</text>
+<text x="210" y="851" fill="#9A9FA8" font-size="14">decode t/s when the answer copies the prompt (n-gram drafting)</text>
 <text x="64" y="893" fill="#F4F4F5" font-size="17">return a file with one small change</text>
-<rect x="420" y="870" width="166.6" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
-<text x="596.6" y="884" fill="#F4F4F5" font-size="17" font-weight="800">95 t/s</text>
-<rect x="420" y="892" width="470.0" height="17" rx="4" fill="#A3161C"/>
-<text x="900.0" y="906" fill="#F4F4F5" font-size="15">268 t/s</text>
-<text x="1136" y="899" text-anchor="end" fill="#FF6A3D" font-size="30" font-weight="800">2.8x</text>
+<rect x="420" y="881" width="470.0" height="17" rx="4" fill="url(#red)" filter="url(#glow)"/>
+<text x="900.0" y="895" fill="#F4F4F5" font-size="17" font-weight="800">268 t/s</text>
 <text x="56" y="962" fill="#9A9FA8" font-size="13">RX 7900 XT 20 GB, 10 October 2026. This runtime: Swift 1.5 Qwen3.8-27B MQ-Q4S, MTP draft. LM Studio: ROCm llama.cpp 2.55.0, Qwen3.8-27B Q4_K_M, MTP draft, q4_0 KV cache.</text>
 </svg>
