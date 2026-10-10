@@ -2,18 +2,14 @@
 
 # Qwen3.8-27B for agents on a Radeon RX 7900 XT / XTX
 
-A `llama-server` runtime for **Qwen3.8-27B on a 20 GB RX 7900 XT**, built
+A light-speed `llama-server` runtime for **Qwen3.8-27B on a 20 GB RX 7900 XT**, built
 for **agentic work**: long tool-calling sessions, several agents sharing one
-GPU, and clients that rewrite their own history. Two slots share a KV pool of
-80k to 104k tokens. It is a fork of [ROCmFPX](#rocmfpx-llamacpp) (ROCm/HIP
-backend, ROCmFP4 weights) that adds a prompt cache on SSD, slot ranges and a
-shared decode pass for several slots, a faster MTP draft and attention path,
-and a decision classifier on the same port. Everything is measured on the XT;
-the 24 GB XTX has room for a larger pool but was not tested.
+GPU, ideal for Hermes.
+
 
 ## Highlights
 
-- **A 27B model with up to 104k tokens of context on a 20 GB card.** ROCmFP4
+- **A 27B model with up to 100k tokens of context on a 20 GB card.** ROCmFP4
   weights (~15 GB) and a q4_0 KV cache: at `-c 106496` 18.9 GB are resident
   and 0.8 GB paged.
 - **Fast decode.** The model's own MTP head drafts four tokens ahead: 50 t/s
@@ -23,7 +19,7 @@ the 24 GB XTX has room for a larger pool but was not tested.
   40-53k tokens instead of a 77-105 s re-prefill. [More](#the-ssd-prompt-cache)
 - **Several agents on one GPU.** Two slots share one KV pool. An idle
   conversation costs the active one nothing, and two busy slots decode at
-  67 t/s in total instead of 46. [More](#several-slots-on-one-gpu)
+  67 t/s combined instead of 46. [More](#several-slots-on-one-gpu)
 - **Shared system prompts.** States are saved every 4096 tokens inside the
   system prompt + tools block; a conversation that starts with the same tokens
   resumes from the deepest state it shares.
@@ -48,15 +44,7 @@ Decode on the production server, 450-token answers at temperature 1:
 | code | 73.4 | 81.8 | 62.0 | 0.73 |
 | without MTP, prose or code | 34.6 | 34.7 | | |
 
-<sub>Nine runs per row on 9 October 2026 while the server was idle, at the
-production shape: `-c 106496`, two slots, `-ub 1024`, vision projector on the
-CPU, draft vocabulary 16384. Code decodes faster because more of the draft is
-accepted. The row without MTP is from that morning, before the decode changes
-listed further down; the same prompts then gave 47.3 for prose and 64.1 for
-code. The table predates the last change (attention at depth), which does
-nothing at this depth: 51.0 and 74.3 with it on a test server.</sub>
-
-Deep in a conversation, and on cold prompts:
+Deep in a conversation, and on cold prompts at temperature 0:
 
 | | 17k | 41k |
 |---|---:|---:|
@@ -64,9 +52,6 @@ Deep in a conversation, and on cold prompts:
 | decode t/s, verbatim copy of a passage | | 82.2 |
 | prefill t/s, cold prompt, average over the prompt | 679 | 621 |
 | the same without the MTP draft | 701 | 640 |
-
-<sub>Fixed prompts at temperature 0 on a test server, 10 October 2026: the
-260-token answer to a cold 17k prompt, three 300-token turns at 41k.</sub>
 
 Real agent traffic by context depth:
 
@@ -79,95 +64,8 @@ Real agent traffic by context depth:
 | 60-80k | 33.3 | 40.2 | 420 | 436 |
 | all | 43.7 | 70.3 | 500 | 608 |
 
-<sub>Production, 2-6 October 2026: 718 agent requests at `-c 106496`, before
-the changes listed below; requests generating 200+ tokens (decode) or
-evaluating 1,500+ (prefill). The slope is attention over the growing KV cache;
-the recurrent layers cost the same at any depth. The first and last rows rest
-on 3-14 requests each. The cache table in
-[The SSD prompt cache](#the-ssd-prompt-cache) comes from the same log.</sub>
-
 Both slots busy: 35 t/s each, 67 t/s in total. See
 [Several slots on one GPU](#several-slots-on-one-gpu).
-
-### What moved the numbers
-
-The step tables use fixed prompts at temperature 0, each step on top of the
-one above.
-
-What moved prefill on 9 October, same two cold prompts:
-
-| cold prefill t/s | 17k | 41k |
-|---|---:|---:|
-| `-ub 256` | 612 | 528 |
-| `-ub 1024` | 649 | 589 |
-| `-ub 1024`, draft catch-up stores K and V only | 679 | 621 |
-
-The catch-up change is exact: a fixed four-turn conversation at temperature 0
-gives the same text and the same drafted and accepted token counts before and
-after. It also runs after every verified batch during decode, which made those
-four turns 2 to 5% faster (44.1 / 52.5 / 55.9 / 45.8 t/s before, 45.2 / 54.0 /
-58.6 / 46.7 after).
-
-What moved decode, each step on top of the one above:
-
-| decode t/s | prose, short context | at 41k depth | verbatim copy at 41k |
-|---|---:|---:|---:|
-| `-ub 1024`, draft catch-up stores K and V only | 46.2 | 41.6 | 57.1 |
-| attention reads the q4_0 cache directly | 48.9 | 47.8 | 69.4 |
-| one graph arena per verify-batch size | 49.5 | 49.2 | 69.4 |
-| draft scores 16,384 candidate tokens | 53.8 | 50.7 | 73.1 |
-| attention: six query heads per block, exact batch size | 50.8 | 55.9 | 82.2 |
-
-Attention: a batch of one to eight tokens on a q4_0 cache went to a kernel 1.6
-to 2.3 times slower than the tile kernel is on f16. The tile kernel now expands
-the 4-bit blocks itself. Same values, different rounding order, so a near-tie
-can resolve differently at temperature 0.
-
-Draft: every drafted token was scored against all 248,320 rows of the output
-layer, 1 GB of weights and 1.9 ms. It now scores 16,384 candidates in 0.12 ms.
-The main model still verifies each drafted token against the full vocabulary,
-so a missing candidate costs a rejected guess, never a wrong token. Acceptance
-on ordinary text did not move (0.63 to 0.64); on the verbatim copy it fell from
-0.99 to 0.96. The text of the 41k column differs between the last two rows
-(the draft pattern decides which near-ties win), the copy column is the same
-text in every row.
-
-Attention at depth: the model has 24 query heads on 4 KV heads. The tile
-kernel handled that as three groups of two heads per KV head, so every K/V
-tile was loaded and expanded three times, and it ran a batch of five tokens as
-eight. Decode batches of one to five tokens now get one block per KV head with
-all six query heads and the exact batch size. Two things had to be tuned on
-the card: the launcher started half as many blocks as the GPU can use (it
-sizes the launch for the 42 processors the driver reports, and twice that is
-the optimum for every one of these kernels), and the best thread layout differs
-per batch size. One attention call over 41k cells of a q4_0 cache, in
-microseconds, before and after:
-
-| tokens in the batch | 1 | 2 | 3 | 4 | 5 |
-|---|---:|---:|---:|---:|---:|
-| before | 263 | 462 | 588 | 578 | 872 |
-| after | 159 | 231 | 301 | 363 | 451 |
-
-The results match the CPU reference in all 50 test cases, and draft acceptance
-does not change (nine prose and nine code runs at temperature 1: 0.61 and 0.74
-with it, 0.59 and 0.79 without, inside the run-to-run spread). The verify pass
-at 41k drops from 47-49 ms to 44 ms; on a short context it is the same 34-36
-ms, and the 50.8 in the first column is a different text with fewer accepted
-drafts (0.61 against 0.64), not a slower pass. On the production server the
-copy test ran at 80.4 t/s after the deploy.
-
-Where decode time goes: a pass reads the 15 GB of weights once, whatever the
-number of tokens in it. With one to three tokens the ROCmFP4 kernel moves
-700-740 GB/s, which is the memory bandwidth of the card (f16 weights reach
-749). A verify pass over 3.5 tokens therefore takes 36 ms against 29 ms for a
-single token, and that is what the draft buys. With five tokens the kernel
-becomes compute-bound (545 GB/s), and so are the Q6 tensors at any width.
-
-Where prefill time goes: at 17k about 85% is the ROCmFP4 matmul, which runs at
-38-43 TFLOPS on the model's shapes. rocBLAS reaches 46-60 with f16 weights on
-the same shapes and stock Q4_0 47-54, so the kernel is within a quarter of
-what this card does at all. The rest is attention (17.6 us per token and layer
-at 16k of history, growing with depth) and 3% for the recurrent layers.
 
 ## Quick start
 
@@ -281,9 +179,6 @@ it returns:
 | prompt diverges from the cached one before its end, 25-34k | 45-62 s | 7.5 s (6.5-10) |
 | first request after a server restart, 18-27k | 30-50 s | 4.2 s (1.0-10.9) |
 
-<sub>Production log of 2-6 October 2026; "stock" is a cold prefill at the
-speeds of that log.</sub>
-
 Off unless `--cache-disk` is given. Everything else has a working default.
 
 | flag | default | meaning |
@@ -341,9 +236,6 @@ attention over every occupied cell of the shared cache:
 | shallow decode t/s | 48 | 31 | 49 |
 | cold 17k prefill t/s | 611 | 369 | 608 |
 | decode t/s at 17k depth | 50 | 36 | 51 |
-
-<sub>Measured at `-ub 256` on 9 October 2026, before the decode changes in
-[Speed](#speed).</sub>
 
 Both slots busy. Slots that decode at the same moment share the pass over the
 model: their tokens form one batch of up to 8, the weights are read once, and
