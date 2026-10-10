@@ -286,6 +286,10 @@ llama_context::llama_context(
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
 
+        // [TAG_NODE_DUMP]
+        const char * LLAMA_NODE_DUMP = getenv("LLAMA_NODE_DUMP");
+        node_dump = LLAMA_NODE_DUMP && atoi(LLAMA_NODE_DUMP) != 0;
+
         // [TAG_DECODE_PROFILE]
         const char * LLAMA_DECODE_PROFILE = getenv("LLAMA_DECODE_PROFILE");
         prof_every = LLAMA_DECODE_PROFILE ? atoll(LLAMA_DECODE_PROFILE) : 0;
@@ -1511,6 +1515,97 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     prof_lap(prof_t_submit);
+
+    // [TAG_NODE_DUMP]
+    if (node_dump) {
+        ggml_backend_sched_synchronize(sched.get());
+
+        auto * gf_cur = res->get_gf();
+
+        std::vector<uint8_t> buf;
+
+        {
+            // the sequence of every token of a small ubatch, in the order of its columns
+            std::string seqs;
+            for (uint32_t k = 0; k < ubatch.n_tokens && ubatch.n_tokens <= 8; ++k) {
+                seqs += " " + std::to_string(ubatch.seq_id[k][0]);
+            }
+
+            LLAMA_LOG_WARN("node dump: ubatch of %u tokens, sequence %d, first position %d, seqs%s\n",
+                    ubatch.n_tokens, (int) ubatch.seq_id[0][0], ubatch.pos ? (int) ubatch.pos[0] : -1, seqs.c_str());
+        }
+
+        for (int i = 0; i < ggml_graph_n_nodes(gf_cur); ++i) {
+            ggml_tensor * t = ggml_graph_node(gf_cur, i);
+
+            if (t->name[0] == 0 || !(t->flags & GGML_TENSOR_FLAG_OUTPUT) || t->op == GGML_OP_SET_ROWS) {
+                continue;
+            }
+
+            const size_t n = ggml_nbytes(t);
+
+            buf.resize(n);
+            ggml_backend_tensor_get(t, buf.data(), 0, n);
+
+            uint64_t h = 1469598103934665603ull;
+            for (size_t k = 0; k < n; ++k) {
+                h ^= buf[k];
+                h *= 1099511628211ull;
+            }
+
+            double l2 = 0.0;
+            if (t->type == GGML_TYPE_F32) {
+                const float * f = (const float *) buf.data();
+                for (size_t k = 0; k < n/sizeof(float); ++k) {
+                    l2 += (double) f[k]*f[k];
+                }
+                l2 = std::sqrt(l2);
+            }
+
+            // a fingerprint per token, for small ubatches and tensors whose last dimension is the tokens: lets a ubatch
+            // that holds several sequences be compared with the same sequences decoded one by one
+            std::string cols;
+            {
+                int d_last = 0;
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    if (t->ne[d] > 1) {
+                        d_last = d;
+                    }
+                }
+
+                const size_t n_tok = ubatch.n_tokens;
+
+                if (t->type == GGML_TYPE_F32 && n_tok <= 8 && n % (n_tok*sizeof(float)) == 0 &&
+                        (n_tok == 1 || (size_t) t->ne[d_last] == n_tok)) {
+                    const float * f     = (const float *) buf.data();
+                    const size_t  n_col = n/sizeof(float)/n_tok;
+
+                    for (size_t c = 0; c < n_tok; ++c) {
+                        uint64_t hc  = 1469598103934665603ull;
+                        double   l2c = 0.0;
+
+                        const uint8_t * p = (const uint8_t *) (f + c*n_col);
+                        for (size_t k = 0; k < n_col*sizeof(float); ++k) {
+                            hc ^= p[k];
+                            hc *= 1099511628211ull;
+                        }
+                        for (size_t k = 0; k < n_col; ++k) {
+                            l2c += (double) f[c*n_col + k]*f[c*n_col + k];
+                        }
+
+                        char tmp[64];
+                        snprintf(tmp, sizeof(tmp), " %016llx:%.9g", (unsigned long long) hc, std::sqrt(l2c));
+                        cols += tmp;
+                    }
+                }
+            }
+
+            LLAMA_LOG_WARN("node dump: %5d %-16s %-28s [%lld,%lld,%lld,%lld] l2 %.9g hash %016llx cols%s\n",
+                    i, ggml_op_name(t->op), t->name,
+                    (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                    l2, (unsigned long long) h, cols.c_str());
+        }
+    }
 
     // [TAG_DECODE_PROFILE]
     if (prof_on) {
@@ -2802,6 +2897,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        // [TAG_NODE_DUMP] keep the values of named tensors until the graph is done
+        if (node_dump) {
+            ggml_set_output(cur);
         }
 
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
