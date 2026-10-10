@@ -9,15 +9,12 @@ GPU, ideal for Hermes.
 
 ## Highlights
 
-- **Faster than LM Studio on the same card.** A two-agent session takes
+- **Quicker agentic loops than LM Studio on the same card.** A two-agent session takes
   125 s here, 168 s on stock llama.cpp with its MTP draft and 17.7 min without
   it; decode is about twice as fast. [Numbers](#speed)
-- **A 27B model with up to 100k tokens of context on a 20 GB card.** ROCmFP4
-  weights (~15 GB) and a q4_0 KV cache: at `-c 106496` 18.9 GB are resident
-  and 0.8 GB paged.
-- **Fast decode.** The model's own MTP head drafts four tokens ahead: 50 t/s
+- **Faster prefill AND decode.** The model's own MTP head drafts four tokens ahead: 50 t/s
   on prose and 73 t/s on code, against 35 t/s without it.
-- **Short thinking, same answers.** Swift 1.5, an optimised Qwen3.8-27B, runs
+- **100k tokens of context on a 20 GB card.** With Swift 1.5 (as high quality Q4 mixed magic quant) of Qwen3.8-27B, runs
   at `reasoning_effort: low`: 50 of 50 on our task set in 28% less time than
   at `xhigh`. [Recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
 - **Switching conversations costs seconds, not minutes.** A conversation is
