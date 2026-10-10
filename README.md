@@ -9,7 +9,7 @@ GPU, ideal for Hermes.
 
 ## Highlights
 
-- **Faster than stock llama.cpp on the same card.** A two-agent session takes
+- **Faster than LM Studio on the same card.** A two-agent session takes
   125 s here, 168 s on stock llama.cpp with its MTP draft and 17.7 min without
   it; decode is about twice as fast. [Numbers](#speed)
 - **A 27B model with up to 100k tokens of context on a 20 GB card.** ROCmFP4
