@@ -960,7 +960,9 @@ static uint32_t kv_lane_head(const llama_kv_cells & cells, llama_seq_id seq_id, 
             return top;
         }
 
-        const uint32_t head = top > n_window ? top - n_window : 0;
+        // never below the lowest cell of the sequence: a short sequence in a region other than the first would
+        // otherwise take free cells below the start of its region, where the lane of its neighbour ends
+        const uint32_t head = std::max(lo, top > n_window ? top - n_window : 0);
 
         // is there room up to the end of the stream? (normally the first cells above the top are free)
         uint32_t n_free = 0;
@@ -976,8 +978,9 @@ static uint32_t kv_lane_head(const llama_kv_cells & cells, llama_seq_id seq_id, 
         // to cell 0, which would stretch the range of this sequence over the whole stream
         i = lo;
     } else {
-        // descending lane: start just above the lowest cell of the sequence
-        i = lo == size ? r1 : std::min(size, lo + n_window);
+        // descending lane: start just above the lowest cell of the sequence, never above its highest one (the cells
+        // above the top of a short sequence belong to the next region)
+        i = lo == size ? r1 : std::min(cells.seq_idx_max_p1(seq_id), lo + n_window);
     }
 
     // walk down until n_tokens free cells are found (one free run of n_tokens for a continuous slot)
