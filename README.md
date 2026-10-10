@@ -14,6 +14,9 @@ GPU, ideal for Hermes.
   and 0.8 GB paged.
 - **Fast decode.** The model's own MTP head drafts four tokens ahead: 50 t/s
   on prose and 73 t/s on code, against 35 t/s without it.
+- **Short thinking, same answers.** Swift 1.5, an optimised Qwen3.8-27B, runs
+  at `reasoning_effort: low`: 50 of 50 on our task set in 28% less time than
+  at `xhigh`. [Recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
 - **Switching conversations costs seconds, not minutes.** A conversation is
   written to SSD with its checkpoints and restored when it returns: 2.9 s for
   40-53k tokens instead of a 77-105 s re-prefill. [More](#the-ssd-prompt-cache)
