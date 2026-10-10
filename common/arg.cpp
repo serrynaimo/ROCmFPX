@@ -1670,6 +1670,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED_RESERVE").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        { "--shared-pass" },
+        { "--no-shared-pass" },
+        "with --kv-unified and several slots: slots that decode at the same time share one pass over the model\n"
+        "instead of taking turns. Applies where every slot has its own range of the KV pool (Qwen3.x models)\n"
+        "(default: enabled)",
+        [](common_params & params, bool value) {
+            params.shared_pass = value;
+        }
+    ).set_env("LLAMA_ARG_SHARED_PASS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION

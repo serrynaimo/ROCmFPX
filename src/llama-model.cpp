@@ -2952,13 +2952,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_recr       */ std::move(filter_recr));
                     }
 
-                    // [TAG_SHARED_PASS] LLAMA_KV_LANES_MERGE=n: slots that decode batches of equal length share one pass
-                    // of at most n tokens. Qwen3.x only: its graph builds attention per sequence range.
+                    // [TAG_SHARED_PASS] sequences that decode batches of equal length share one pass. On by default
+                    // wherever the cache has slot ranges (llama_kv_lanes_set_merge() switches it off). Qwen3.x only:
+                    // its graph builds attention per sequence range.
+                    // LLAMA_KV_LANES_MERGE=n overrides the token limit of such a pass for experiments, 0 = never share.
                     if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
                         const char * env = getenv("LLAMA_KV_LANES_MERGE");
                         auto * hybrid = dynamic_cast<llama_memory_hybrid *>(res);
-                        if (hybrid && env && atoi(env) > 0) {
-                            hybrid->get_mem_attn()->set_lanes_merge((uint32_t) atoi(env));
+                        if (hybrid) {
+                            hybrid->get_mem_attn()->set_lanes_merge_limit(
+                                    env ? (uint32_t) std::max(0, atoi(env)) : llama_kv_cache::LANES_MERGE_LIMIT_DEFAULT);
                         }
                     }
                 } else {

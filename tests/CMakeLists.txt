@@ -157,6 +157,9 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
 
+# [TAG_KV_LANES] [TAG_SHARED_PASS] needs a Qwen3.x hybrid model: test-rocmfpx-seq-parity -m <model.gguf>
+llama_build(test-rocmfpx-seq-parity.cpp)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)

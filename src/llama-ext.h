@@ -98,6 +98,10 @@ LLAMA_API bool llama_kv_lanes_enabled(const struct llama_context * ctx);
 // such a merged batch. 0 = every sequence gets its own pass
 LLAMA_API uint32_t llama_kv_lanes_merge_max(const struct llama_context * ctx);
 
+// [TAG_SHARED_PASS] the shared pass is on by default in every context that supports it (slot ranges, Qwen3.x);
+// false gives every sequence its own pass again, true restores the default. No effect elsewhere.
+LLAMA_API void llama_kv_lanes_set_merge(struct llama_context * ctx, bool enable);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

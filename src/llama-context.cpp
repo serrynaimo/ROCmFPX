@@ -4327,6 +4327,15 @@ uint32_t llama_kv_lanes_merge_max(const llama_context * ctx) {
     return 0;
 }
 
+// [TAG_SHARED_PASS]
+void llama_kv_lanes_set_merge(llama_context * ctx, bool enable) {
+    llama_memory_t mem = llama_get_memory(ctx);
+
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        hybrid->get_mem_attn()->set_lanes_merge(enable);
+    }
+}
+
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
 }

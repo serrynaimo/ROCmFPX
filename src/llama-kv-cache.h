@@ -208,8 +208,15 @@ public:
 
     // [TAG_SHARED_PASS] with lanes, a ubatch normally holds one sequence. With a merge limit of n > 0, sequences of equal
     // length are decoded in one ubatch of at most n tokens: the weights are read once for all of them and the graph
-    // attends per sequence (get_kv_ranges()). Only for owners whose graph builds attention per range.
-    void     set_lanes_merge(uint32_t n_max) { lanes_merge = lanes ? n_max : 0; }
+    // attends per sequence (get_kv_ranges()). Only for owners whose graph builds attention per range: they set the
+    // limit once (which also turns the shared pass on), set_lanes_merge() then switches it off and on again.
+    //
+    // The default limit is the widest batch that still takes the small-batch matrix-vector kernels of the GPU backends
+    // (MMVQ_MAX_BATCH_SIZE): beyond it a pass costs more than the two passes it replaces.
+    static constexpr uint32_t LANES_MERGE_LIMIT_DEFAULT = 8;
+
+    void     set_lanes_merge_limit(uint32_t n_max) { lanes_merge_limit = lanes ? n_max : 0; lanes_merge = lanes_merge_limit; }
+    void     set_lanes_merge(bool enable)          { lanes_merge = enable ? lanes_merge_limit : 0; }
     uint32_t get_lanes_merge() const { return lanes_merge; }
 
     // the ubatch as blocks of n_tokens/n_blocks consecutive tokens, one sequence per block: the number of blocks if the
@@ -328,7 +335,9 @@ private:
     bool lanes = false;
 
     // [TAG_SHARED_PASS] max. tokens of a ubatch that merges sequences of equal length, 0 = one sequence per ubatch
-    uint32_t lanes_merge = 0;
+    // lanes_merge_limit is the value while the shared pass is on (0 = the owner's graph cannot do it)
+    uint32_t lanes_merge       = 0;
+    uint32_t lanes_merge_limit = 0;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;

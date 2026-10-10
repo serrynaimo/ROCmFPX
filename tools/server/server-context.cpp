@@ -1143,6 +1143,11 @@ private:
             return false;
         }
 
+        // [TAG_SHARED_PASS] on by default wherever the context supports it, --no-shared-pass turns it off
+        if (ctx_tgt != nullptr && !params_base.shared_pass) {
+            llama_kv_lanes_set_merge(ctx_tgt, false);
+        }
+
         if (ctx_tgt == nullptr) {
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
@@ -1354,8 +1359,10 @@ private:
 
             // [TAG_SHARED_PASS]
             if (llama_kv_lanes_merge_max(ctx_tgt) > 0) {
-                SRV_INF("shared KV pool: slots that decode batches of the same length share one pass of up to %u tokens\n",
+                SRV_INF("shared KV pool: slots that decode batches of the same length share one pass of up to %u tokens (--no-shared-pass turns this off)\n",
                         llama_kv_lanes_merge_max(ctx_tgt));
+            } else if (!params_base.shared_pass) {
+                SRV_INF("%s", "shared KV pool: --no-shared-pass, every slot decodes in a pass of its own\n");
             }
         }
 
