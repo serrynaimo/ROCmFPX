@@ -38,6 +38,10 @@ weights) plus a server-side prompt cache on SSD.
   cache, so a 41k-token conversation resting in one slot cut the other slot's
   decode from 48 to 31 t/s and its prefill from 611 to 369 t/s. Here both stay
   at 48 and 608.
+- **Two busy slots share one pass.** When both slots decode at the same
+  moment their tokens go through the model together instead of taking turns:
+  67 t/s in total against 46, with one slot alone at 55. The logits are the
+  same, bit for bit, as with a pass per slot.
 - **Shared system prompts.** States are saved every 4096 tokens inside the
   system prompt + tools block and at its end. Any conversation that starts with
   the same tokens resumes from the deepest state it still shares.
@@ -101,6 +105,7 @@ The server speaks the usual OpenAI-compatible API on `/v1`.
 | `-c 81920`, q4_0 KV | about what a 20 GB card holds; KV costs ~18 KB/token. Whatever does not fit, Windows silently pages to system RAM. We run `-c 106496` in production: 18.9 GB resident, 0.8 GB paged. |
 | `-np 2 --kv-unified --kv-unified-reserve 12288` | two slots share one pool instead of splitting it. The reserve admits a second request only while both can still generate 12k tokens, else it waits in the queue; idle slots are saved to the cache before their cells are taken. Without it a full pool fails both requests and wipes both contexts. Each slot's cells stay in its own range of the pool (with more slots, two per region), so attention covers the active conversation only. |
 | `--no-cache-idle-slots` | keeps the idle conversation resident; the default saves and clears it at every new task, which leaves one live conversation. |
+| shared pass (on by default) | slots that decode at the same moment go through the model in one pass: 67 t/s in total with both slots busy instead of 46, same logits. `--no-shared-pass` gives every slot its own pass again. |
 | `--no-mmproj-offload` | the 0.9 GB vision projector was the whole paged share at two slots. Images cost 7-12 s to the first token instead of 3-5 s. |
 | `-ub 1024` | prefill +6% at 17k and +11% at 41k over 256, for 0.3 GB more paged memory; 512 gives +4% and +8% for 0.1 GB. Decode does not change with it (55.7 against 56.0 t/s on identical text). |
 | MTP draft, `n-max 4` | +45% decode on prose, +112% on code, for 1.4 GB of VRAM and 3% of prefill speed. The draft head has its own KV cache; for prompt tokens only its K and V are computed, nothing else of the block is ever read. |
@@ -249,12 +254,35 @@ changes above):
 | cold 17k prefill t/s | 611 | 369 | 608 |
 | decode t/s at 17k depth | 50 | 36 | 51 |
 
-Two slots working at the same moment share the GPU, not its speed: both
-decoding gives 24 to 28 t/s each (one alone: 55), and a slot decoding while the
-other prefills a cold 17k prompt gets about 10 t/s until that prefill is done.
-Each slot gets its own pass over the weights: a loop with both decoding takes
-84 ms, exactly two single-slot loops.
-Both conversations stay warm.
+Two slots working at the same moment. Slots that decode at the same moment
+share the pass over the model: their tokens form one batch of up to 8, the
+weights are read once, and attention still runs per slot over its own range.
+The draft heads draft in step while both are busy (at most 3 tokens ahead
+instead of 4), so that both slots bring batches of the same length. With a
+pass per slot a loop with both decoding took 84 ms, exactly two single-slot
+loops; shared it takes 44 ms.
+
+| both slots busy | a pass per slot (`--no-shared-pass`) | shared pass |
+|---|---:|---:|
+| both decoding: each slot, t/s | 24.9 and 23.9 | 35.1 and 34.6 |
+| both decoding: total t/s | 46.0 | 66.7 |
+| one slot alone, t/s | 54.0 | 54.8 |
+| one prefills a cold 17k prompt: its prefill t/s | 672 | 668 |
+| ... and the other slot's decode t/s meanwhile | 10.1 | 10.3 |
+
+The logits of a shared pass are the same, bit for bit, as those of each slot
+decoded in a pass of its own (checked on the GPU for 1 to 4 tokens per slot,
+with and without rejected draft tokens; `tests/test-rocmfpx-seq-parity.cpp`
+is the CPU version of that check). A prefilling slot still takes passes of its
+own, which is why the slot beside a cold prefill waits. Both conversations
+stay warm.
+
+The same conversation does not produce bit-identical logits in slot 0 and in
+slot 1: the second slot fills its range from the top of the pool downwards,
+attention sums its cells in another order, and the last bits differ. With a
+4-bit KV cache that grows to 0.1 to 0.3 in the log-probabilities of the ten
+most likely tokens, about what the tile and the vector attention kernel
+differ by on one and the same slot (0.08 to 0.16).
 
 ## Other cards
 
@@ -263,10 +291,10 @@ elsewhere; the card-specific fast paths are gated so that other hardware keeps
 the stock behaviour.
 
 - **Any backend (CPU, Vulkan, other GPUs).** The slot ranges on the shared
-  pool, the MTP changes, the draft vocabulary, the graph arenas and the SSD
-  prompt cache live in the model core and the server and do not depend on the
-  GPU. The tree builds with gcc and the Vulkan backend (checked on 10 October
-  2026).
+  pool, the shared pass of busy slots, the MTP changes, the draft vocabulary,
+  the graph arenas and the SSD prompt cache live in the model core and the
+  server and do not depend on the GPU. The tree builds with gcc and the Vulkan
+  backend (checked on 10 October 2026).
 - **AMD cards with HIP.** The GPU backend builds for the gfx11 targets: RDNA3
   (RX 7000 series) and RDNA3.5 (gfx1151, checked on 10 October 2026). It does
   not build for RDNA2 or RDNA4 targets, because the bf16 matmul file inherited
