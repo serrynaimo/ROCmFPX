@@ -13,7 +13,8 @@ GPU, ideal for Hermes.
   125 s here, 168 s on stock llama.cpp with its MTP draft and 17.7 min without
   it; decode is about twice as fast. [Numbers](#speed)
 - **Faster prefill AND decode.** The model's own MTP head drafts four tokens ahead: 50 t/s
-  on prose and 73 t/s on code, against 35 t/s without it.
+  on prose and 73 t/s on code, against 35 t/s without it. Code edits that copy
+  the prompt run at 250-270 t/s through n-gram drafting.
 - **100k tokens of context on a 20 GB card.** With Swift 1.5 (as high quality Q4 mixed magic quant) of Qwen3.8-27B, runs
   at `reasoning_effort: low`: 50 of 50 on our task set in 28% less time than
   at `xhigh`. [Recipe](docs/rocmfpx/swift-1.5-qwen3.8-27b-mq-q4s.md)
@@ -39,6 +40,8 @@ been measured on an XTX.
 
 ## Speed
 
+![Speed against LM Studio (llama.cpp + MTP) on an RX 7900 XT](media/speed-vs-lmstudio.svg)
+
 Against stock llama.cpp on the same card: one scripted two-agent session with
 identical prompts (14 requests; an orchestrator grows from 4k to 41k tokens, a
 10k-token worker is called twice in between):
@@ -52,16 +55,19 @@ identical prompts (14 requests; an orchestrator grows from 4k to 41k tokens, a
 | decode t/s at 4k depth | 32.3 | 31.5 | 59.1 |
 | decode t/s at 17k depth | 17.8 | 30.9 | 56.1 |
 | decode t/s at 41k depth | 10.6 | 24.3 | 53.7 |
+| decode t/s, code edit that copies the prompt | | | 268 |
 
 <sub>10 October 2026. Stock is LM Studio's ROCm llama.cpp runtime 2.55.0 with
-`Qwen3.8-27B-Q4_K_M`, flash attention, a q4_0 KV cache and two sessions.</sub>
+`Qwen3.8-27B-Q4_K_M`, flash attention, a q4_0 KV cache and two sessions. The
+edit row is n-gram drafting (95 t/s without it); it was not measured on LM
+Studio.</sub>
 
 Decode on the production server, 450-token answers at temperature 1:
 
 | decode t/s | median | peak | lowest | draft accepted |
 |---|---:|---:|---:|---:|
-| prose | 50.1 | 53.2 | 47.4 | 0.58 |
-| code | 73.4 | 81.8 | 62.0 | 0.73 |
+| prose | 50.1 | 53.2 | 45.9 | 0.60 |
+| code | 72.6 | 86.4 | 57.0 | 0.72 |
 | without MTP, prose or code | 34.6 | 34.7 | | |
 
 Deep in a conversation, and on cold prompts at temperature 0:
@@ -69,7 +75,7 @@ Deep in a conversation, and on cold prompts at temperature 0:
 | | 17k | 41k |
 |---|---:|---:|
 | decode t/s at that depth | 54.7 | 55.9 |
-| decode t/s, verbatim copy of a passage | | 82.2 |
+| decode t/s, verbatim copy of a passage | | 180 |
 | prefill t/s, cold prompt, average over the prompt | 679 | 621 |
 | the same without the MTP draft | 701 | 640 |
 
@@ -123,7 +129,7 @@ llama-server -m Swift-1.5-Qwen3.8-27B-ROCMFPX-MQ-Q4S.gguf --mmproj mmproj-Qwen3.
   -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -b 2048 -ub 1024 --no-mmproj-offload ^
   --ctx-checkpoints 8 --checkpoint-min-step 2048 ^
   --cache-ram 0 --cache-disk D:\llama-cache --cache-disk-limit 65536 --cache-disk-checkpoints 4 ^
-  --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.60 ^
+  --spec-type "draft-mtp,ngram-map-k4v" --spec-draft-n-max 4 --spec-draft-p-min 0.60 ^
   --chat-template-kwargs "{\"reasoning_effort\":\"low\"}" ^
   --reasoning-preserve --temp 1 --sleep-idle-seconds -1 ^
   --alias qwen/qwen3.8-27b --host 0.0.0.0 --port 1234 --api-key-file api-keys.txt
@@ -140,7 +146,8 @@ Flags:
 | `--no-cache-idle-slots` | keeps the idle conversation resident; the default saves and clears it at every new task, which leaves one live conversation. |
 | `--no-mmproj-offload` | the 0.9 GB vision projector was the whole paged share at two slots. Images cost 7-12 s to the first token instead of 3-5 s. |
 | `-ub 1024` | prefill +6% at 17k and +11% at 41k over 256, for 0.3 GB more paged memory; 512 gives +4% and +8% for 0.1 GB. Decode does not change with it (55.7 against 56.0 t/s on identical text). |
-| `--spec-type draft-mtp --spec-draft-n-max 4` | +45% decode on prose, +112% on code, for 1.4 GB of VRAM and 3% of prefill speed. The draft head has its own KV cache; for prompt tokens only its K and V are computed, nothing else of the block is ever read. |
+| `--spec-type draft-mtp`, `--spec-draft-n-max 4` | +45% decode on prose, +112% on code, for 1.4 GB of VRAM and 3% of prefill speed. The draft head has its own KV cache; for prompt tokens only its K and V are computed, nothing else of the block is ever read. |
+| `--spec-type "...,ngram-map-k4v"` | n-gram drafting in front of MTP: where the last tokens repeat an earlier place of the context, the continuation found there is drafted, otherwise MTP drafts as before. Code edits that copy the prompt 95 -> 268 t/s, a verbatim copy at 41k 83 -> 180 t/s; ordinary text gives the same output at the same speed. Quote the value in a .cmd file: cmd splits arguments at commas. |
 | `--ctx-checkpoints 8` | kept in host RAM, ~200 MiB each. When the list is full, the one whose removal leaves the smallest gap is dropped; the one at the first user message never is. |
 | `--cache-disk` | conversations and their checkpoints are kept on SSD. See [The SSD prompt cache](#the-ssd-prompt-cache). |
 | `--load-mode dio` | the default memory-mapped load keeps the 15 GB model file in system RAM. |
